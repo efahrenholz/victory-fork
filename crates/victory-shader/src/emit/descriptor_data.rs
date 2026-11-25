@@ -3,6 +3,7 @@
 //! the memory a buffer's address points at. The fields the host can tell are rebuilt from its
 //! view; the others have no value.
 
+use crate::RootType;
 use super::{
     Attr, Bin, Fields, Inst, Lower, Operand, Reg, ResourceType, Role, Site, Source, UsedResource, V,
     Val, Why,
