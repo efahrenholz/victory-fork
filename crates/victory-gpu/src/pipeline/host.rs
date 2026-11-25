@@ -250,18 +250,6 @@ impl GraphicsState {
         )
     }
 
-    /// The blend state for the host. D3D12 refuses a pipeline that blends
-    /// into an integer render target (debug layer message 676); the console
-    /// creates it. With `VICTORY_BLEND_INT_OFF=1` blending is turned off for
-    /// the integer targets and kept for the others.
-    fn host_blend(&self) -> D3D12_BLEND_DESC {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_BLEND_INT_OFF").is_some_and(|v| v == "1")) {
-            return self.blend;
-        }
-        blend_without_integers(self.blend, &self.targets)
-    }
-
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {

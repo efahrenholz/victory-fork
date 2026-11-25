@@ -4843,7 +4843,7 @@ fn in_place_upgrade() -> u64 {
     if crate::inplace::level() < 3 {
         return 0;
     }
-    let big = |len: u64| cards() && len.next_multiple_of(1 << 16) >= card_limits().0;
+    let big = |len: u64| cards() && len.next_multiple_of(1 << 16) >= card_limits().least;
     let gone: Vec<Arc<Shadow>> = {
         let mut map = buffers_write();
         let mut gone = Vec::new();
@@ -5452,7 +5452,7 @@ fn warmed(last: u64, frame: u64, run: u64, hot: u64) -> (u64, bool) {
 /// Windows in residents the new one replaces are let go too.
 fn hot_window(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, key: (u64, u64)) -> Arc<Shadow> {
     let shadow = map[&key].clone();
-    if !crate::resident::on() || shadow.place.is_none() || !cards() || shadow.len < card_limits().0 {
+    if !crate::resident::on() || shadow.place.is_none() || !cards() || shadow.len < card_limits().least {
         return shadow;
     }
     let frame = crate::frame::current();
