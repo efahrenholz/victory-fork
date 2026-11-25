@@ -3647,8 +3647,9 @@ impl State {
         let group_base = if kind == DISPATCH { group_base_word(p) } else { None };
         let mut second: Option<((u32, u32), u64)> = None;
         // A record that misses its window: a slot the list's prelude fills,
-        // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        // if the list still gathers ([`gathers`]). Skip in-place/resident
+        // argument buffers whose shaders may write them in the same list.
+        let gathered = if hit.is_none() && windowed && gathers() && !args.in_place() {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
