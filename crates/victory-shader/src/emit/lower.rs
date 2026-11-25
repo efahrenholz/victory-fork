@@ -192,6 +192,13 @@ struct Lower<'a> {
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
+    /// First DXIL block where the program's body runs: `s.entry`, or the
+    /// active arm after a partial-dispatch early-exit branch.
+    body_entry: usize,
+    /// Per-lane active predicate for partial `DispatchX(USE_THREAD_DIMENSIONS)`
+    /// when early-exit is not used (group barriers or wave64-over-wave32
+    /// LDS exchange require all threads to remain active).
+    partial_active: Option<V>,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
@@ -1501,6 +1508,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let entry = s.entry;
         Lower {
             s,
             x,
@@ -1510,6 +1518,8 @@ impl<'a> Lower<'a> {
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
+            body_entry: entry,
+            partial_active: None,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
@@ -1698,7 +1708,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
@@ -1849,7 +1859,12 @@ impl<'a> Lower<'a> {
                     .masks
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
-                let on = self.boolean(m, c)?;
+                let mut on = self.boolean(m, c)?;
+                if let Some(active) = self.partial_active
+                    && self.x.st.active.contains(&mask)
+                {
+                    on = self.s.m.bin(c, Bin::And, on, active);
+                }
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -1879,7 +1894,12 @@ impl<'a> Lower<'a> {
             .masks
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
-        let on = self.boolean(m, c)?;
+        let mut on = self.boolean(m, c)?;
+        if let Some(active) = self.partial_active
+            && self.x.st.active.contains(&mask)
+        {
+            on = self.s.m.bin(c, Bin::And, on, active);
+        }
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -2243,6 +2263,8 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        } else if self.s.threads.is_some() && crate::spill::is_spilled(self.x.native) {
+            self.dispatch_threads_prologue(&order);
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -2925,7 +2947,7 @@ impl<'a> Lower<'a> {
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
@@ -3168,7 +3190,7 @@ impl<'a> Lower<'a> {
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
-                    None => self.s.entry,
+                    None => self.body_entry,
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
@@ -3177,7 +3199,12 @@ impl<'a> Lower<'a> {
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let mut bit = bit?;
+                if let Some(active) = self.partial_active
+                    && self.x.st.active.contains(&lo)
+                {
+                    bit = self.s.m.bin(at, Bin::And, bit, active);
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -3838,11 +3865,14 @@ impl<'a> Lower<'a> {
         }
         let made = self.def_block.get(&scc).copied();
         let at = match made {
-            None => self.s.entry,
+            None => self.body_entry,
             Some(b) if b == self.cur_ir => self.cur,
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
-        let bit = self.boolean(m, at)?;
+        let mut bit = self.boolean(m, at)?;
+        if let Some(active) = self.partial_active {
+            bit = self.s.m.bin(at, Bin::And, bit, active);
+        }
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
@@ -3868,7 +3898,16 @@ impl<'a> Lower<'a> {
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
             let c = self.cur;
-            let mine = self.boolean(when, c)?;
+            let mut mine = self.boolean(when, c)?;
+            if let Some(active) = self.partial_active {
+                mine = if any {
+                    self.s.m.bin(c, Bin::And, mine, active)
+                } else {
+                    let t = self.s.m.bool(true);
+                    let off = self.s.m.bin(c, Bin::Xor, active, t);
+                    self.s.m.bin(c, Bin::Or, mine, off)
+                };
+            }
             let i1t = self.s.t.i1;
             self.s.flags |= flags::WAVE_OPS;
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
@@ -3886,12 +3925,15 @@ impl<'a> Lower<'a> {
         // what the halves exchange is "some lane speaks against" either way (for `any`:
         // some lane's `when` holds; else: some lane's does not), so a half with no lane says
         // nothing
-        let set = if any {
+        let mut set = if any {
             mine
         } else {
             let t = self.s.m.bool(true);
             self.s.m.bin(c, Bin::Xor, mine, t)
         };
+        if let Some(active) = self.partial_active {
+            set = self.s.m.bin(c, Bin::And, set, active);
+        }
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
@@ -3971,6 +4013,85 @@ impl<'a> Lower<'a> {
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+        }
+    }
+
+    /// Guard for a memory or side-effecting instruction: `guard(b, i)` AND
+    /// `partial_active` when partial-thread-dimension masking stays in
+    /// predicated mode (for group barriers or wave64-over-wave32 exchange).
+    fn effect_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        let g = self.guard(b, i)?;
+        match (g, self.partial_active) {
+            (Some(g), Some(a)) => Ok(Some(self.s.m.bin(self.cur, Bin::And, g, a))),
+            (g, a) => Ok(g.or(a)),
+        }
+    }
+
+    /// Partial thread-group masking for `DispatchX` with
+    /// `USE_THREAD_DIMENSIONS` (`flags & 0x20`): when the host passes a
+    /// non-zero thread count along an axis whose group size exceeds 1,
+    /// lanes at or past that count behave as inactive in initial hardware
+    /// `EXEC`.
+    ///
+    /// When the program has neither a group barrier nor wave64-over-wave32
+    /// LDS exchange (and block 0 has no back-edge), inactive lanes return
+    /// immediately after entry inputs are computed, so hardware `EXEC`,
+    /// wave ballots and wave reductions see the exact active lane set with
+    /// zero per-instruction guard overhead. Otherwise every thread stays
+    /// alive for group barriers and `partial_active` predicates memory
+    /// accesses, wave ballots and wave reductions.
+    fn dispatch_threads_prologue(&mut self, order: &[usize]) {
+        let Some(threads) = self.s.threads else {
+            return;
+        };
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let mut active: Option<V> = None;
+        for (c, &dim) in threads.iter().enumerate() {
+            if dim <= 1 {
+                continue;
+            }
+            let limit = self.host_word(
+                RootType::Other(super::shader::USER_DISPATCH_THREADS),
+                0,
+                c as u32,
+            );
+            let Val::I32(tid) = self.thread_id(c as u8) else {
+                unreachable!()
+            };
+            let Val::I32(gid) = self.compute_id("groupId.i32", 94, c as u8) else {
+                unreachable!()
+            };
+            let g = self.s.m.i32(dim);
+            let base = self.s.m.bin(e, Bin::Mul, gid, g);
+            let global = self.s.m.bin(e, Bin::Add, base, tid);
+            let no_limit = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let in_range = self.s.m.cmp(e, pred::IULT, global, limit);
+            let ok = self.s.m.bin(e, Bin::Or, no_limit, in_range);
+            active = Some(match active {
+                None => ok,
+                Some(prev) => self.s.m.bin(e, Bin::And, prev, ok),
+            });
+        }
+        let Some(active) = active else {
+            return;
+        };
+        let has_barrier = self.x.p.blocks.iter().enumerate().any(|(b, blk)| {
+            !self.no_barrier.contains(&b) && blk.insts.iter().any(|i| i.name() == "s_barrier")
+        });
+        let can_early_exit = self.exchange.is_none()
+            && !has_barrier
+            && self.x.p.blocks[order[0]].preds.is_empty();
+        if can_early_exit {
+            let body = self.s.m.new_block();
+            let exit = self.s.m.new_block();
+            self.s.m.terminate(e, Term::CondBr(active, body, exit));
+            self.s.m.terminate(exit, Term::Ret);
+            self.body_entry = body;
+            self.block[order[0]] = Some(body);
+            self.cur = body;
+        } else {
+            self.partial_active = Some(active);
         }
     }
 
@@ -4421,7 +4542,12 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
-        let guard = self.guard(b, i)?;
+        let is_shuffle = name == "ds_swizzle_b32" || name.contains("permute");
+        let guard = if is_shuffle {
+            self.guard(b, i)?
+        } else {
+            self.effect_guard(b, i)?
+        };
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
         let dst_reg = match dst {
@@ -9463,7 +9589,7 @@ impl<'a> Lower<'a> {
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -10257,7 +10383,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
