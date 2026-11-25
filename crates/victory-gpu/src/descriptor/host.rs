@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -26,6 +27,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Lock-free mirror of `made` updated with Release after host slot creation
+    /// and cleared before unmaking, so hot-path `mirror` hits avoid locking `made`.
+    made_keys: Vec<AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -968,6 +972,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_keys: (0..count).map(|_| AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             checked: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -1451,6 +1456,9 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
+        if let Some(slot) = self.made_keys.get(index as usize) {
+            slot.store(0, Ordering::Release);
+        }
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
@@ -1960,6 +1968,15 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Fast path: slot already holds this exact made descriptor (skip when
+        // resident replacement check is active on a draw).
+        if tag == VIEW_TAG
+            && !(for_draw && crate::resident::on())
+            && self.made_keys[index as usize].load(Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut stale_unmade: Vec<u32> = Vec::new();
         let mut self_changed = false;
         let result = {
@@ -1970,6 +1987,7 @@ impl HostHeap {
                     // Not a view of ours (never written, or of a resource the
                     // title released): nothing to read.
                     if made[index as usize] != 0 {
+                        self.made_keys[index as usize].store(0, Ordering::Release);
                         made[index as usize] = 0;
                         self.make_null(index);
                         let _ = self.note_buffer(index, None, false);
@@ -1995,6 +2013,7 @@ impl HostHeap {
                                 .as_ref()
                                 .is_some_and(crate::resident::was_replaced);
                             if replaced {
+                                self.made_keys[index as usize].store(0, Ordering::Release);
                                 made[index as usize] = 0;
                                 crate::resident::slot_remade();
                             }
@@ -2037,7 +2056,9 @@ impl HostHeap {
                             Some(view)
                         } else {
                             self_changed = true;
-                            made[index as usize] = if later { 0 } else { key };
+                            let new_key = if later { 0 } else { key };
+                            self.made_keys[index as usize].store(0, Ordering::Release);
+                            made[index as usize] = new_key;
                             let kept = if later {
                                 None
                             } else {
@@ -2047,6 +2068,9 @@ impl HostHeap {
                                 null_for(&view, self.cpu(index));
                             }
                             self.keep(index, kept.flatten());
+                            if new_key != 0 {
+                                self.made_keys[index as usize].store(new_key, Ordering::Release);
+                            }
                             Some(view)
                         }
                     } else {
