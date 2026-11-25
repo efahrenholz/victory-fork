@@ -2582,40 +2582,43 @@ impl State {
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
-            // The pass bound its own heap, root signature and pipeline:
-            // the next draw or dispatch binds the title's again.
+            // Our pass set its own pipeline, root signature and heap: the next bind sets the title's again.
             self.host_pipeline = 0;
             self.host_roots = [0; 2];
             self.host_heaps = [0; 2];
         }
     }
 
-    /// After a dispatch of `p`: the stand-in for indirect light
-    /// ([`crate::ambient`]), if `p` is the program that resolves it and
-    /// the stand-in is on. Whether anything was recorded.
+    /// After a dispatch of `p`: the least indirect light, if it is the
+    /// program that resolves that (after Belobug/VIctory-Belobug-AMD).
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
-        if crate::ambient::level().is_none() {
-            return false;
-        }
-        let (slot, offset) = crate::ambient::LIGHT;
-        let named = stage.translated().used.iter().any(|u| {
-            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-        });
-        let light = match self.roots_ref(true).get(usize::from(slot)) {
-            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
-                Some(View::Unordered(r, ..)) => r,
-                _ => 0,
-            },
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
         if light == 0 {
-            once!("no stand-in for indirect light: the resolve's tables are not as expected");
+            once!("no ambient light: other tables");
             return false;
         }
-        crate::ambient::replace(list, light as This)
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

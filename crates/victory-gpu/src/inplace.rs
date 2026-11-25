@@ -375,7 +375,7 @@ fn place_stretch(start: u64, len: u64, section: usize, offset: u64) -> Option<Pl
         );
     }
     say();
-    Some(Placed { buffer, heap, gpu, bias: lead })
+    Some(Placed { buffer, heap: heap.into(), gpu, bias: lead, section: None })
 }
 
 /// What [`place_for`] gave is gone.
