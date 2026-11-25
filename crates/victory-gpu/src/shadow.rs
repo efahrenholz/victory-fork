@@ -2654,6 +2654,19 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// As [`Shadow::refresh`], for several spans of one list: the spans are
+    /// clamped as `refresh` clamps them, and all their steps go in under one
+    /// lock of the list (`HostList::defer_refreshes`).
+    pub(crate) fn refresh_many<'a>(
+        list: &HostList,
+        spans: impl IntoIterator<Item = (&'a Arc<Shadow>, u64, u64)>,
+    ) {
+        list.defer_refreshes(spans.into_iter().map(|(shadow, address, len)| {
+            let len = len.min(shadow.start + shadow.len - address);
+            (shadow, address as usize, len as usize)
+        }));
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
