@@ -1636,40 +1636,100 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
+        let process_pair = |index: u32, handle: Option<u64>| -> (u32, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>) {
+            let Some(handle) = handle else {
+                return (index, None);
             };
             let Some(view) = host.mirror(index, handle, true) else {
-                continue;
+                return (index, None);
             };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-                crate::host::log_removal_context();
-            }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
+                return (index, None);
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            (index, Some((shadow, address, address + len)))
+        };
+        if slots.len() >= 512 && std::env::var_os("VICTORY_WIDE_HEAP").is_none_or(|v| v != "0") {
+            let pairs: Vec<(u32, Option<u64>)> = slots
+                .iter()
+                .map(|&index| (index, heap.handle(index)))
+                .collect();
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 6);
+            let chunk = pairs.len().div_ceil(workers);
+            let results: Vec<Vec<(u32, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)>> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = pairs
+                        .chunks(chunk)
+                        .map(|part| {
+                            s.spawn(move || {
+                                let mut out = Vec::with_capacity(part.len());
+                                for &(index, handle) in part {
+                                    out.push(process_pair(index, handle));
+                                }
+                                out
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_default())
+                        .collect()
+                });
+            if alive && let Some(why) = crate::descriptor::host::device_removed() {
+                alive = false;
+                GONE.store(true, Ordering::Relaxed);
+                tracing::error!(why, count = slots.len(), "the host device went while buffer views of the heap were made in parallel");
+                crate::host::log_removal_context();
+            }
+            for batch in results {
+                for (index, entry) in batch {
+                    match entry {
+                        Some(v) => {
+                            ranges.insert(index, v);
+                        }
+                        None => {
+                            ranges.remove(&index);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (n, &index) in slots.iter().enumerate() {
+                let (_, entry) = process_pair(index, heap.handle(index));
+                match entry {
+                    Some(v) => {
+                        ranges.insert(index, v);
+                    }
+                    None => {
+                        ranges.remove(&index);
+                    }
+                }
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                    crate::host::log_removal_context();
+                }
+            }
         }
+        let _ = alive;
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
