@@ -4665,7 +4665,7 @@ impl Host {
         // (`relay_card_inflight`). Sends up to `after` are numbered, and the
         // submission numbered `after` may not have its lists on the queue
         // yet; every one before it has (the submission lock).
-        let landed = plans.iter().map(|p| p.sent_as).max();
+        let landed = plans.iter().map(|p| p.1.sent_as).max();
         if inflight_fetch()
             && should_record_brought(after, landed)
             && let Some(inflight) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|w| w.inflight.as_mut())
