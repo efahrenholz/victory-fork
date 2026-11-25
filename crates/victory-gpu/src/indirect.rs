@@ -1158,11 +1158,16 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        for piece_bytes in [4 << 10, 16 << 10, 64 << 10] {
+            check_card_compare(piece_bytes);
+        }
+    }
+
+    fn check_card_compare(piece_bytes: usize) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, &crate::host::card_shader(crate::host::CARD_COMPARE)).expect("the card compare must compile on WARP");
-        let piece_bytes = crate::shadow::card_piece_bytes();
+        let compare = compile_cs(&warp.device, &crate::host::card_shader(crate::host::CARD_COMPARE, piece_bytes)).expect("the card compare must compile on WARP");
         const PIECES: u32 = 3;
         let size = piece_bytes * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
@@ -1225,13 +1230,18 @@ void main() {
     /// slots is written but copies nothing.
     #[test]
     fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
+        for piece_bytes in [4 << 10, 16 << 10, 64 << 10] {
+            check_card_fetch(piece_bytes);
+        }
+    }
+
+    fn check_card_fetch(piece_bytes: usize) {
         use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, &crate::host::card_shader(CARD_COMPARE)).expect("the card compare must compile on WARP");
-        let fetch = compile_cs(&warp.device, &crate::host::card_shader(CARD_FETCH)).expect("the card fetch must compile on WARP");
-        let piece_bytes = crate::shadow::card_piece_bytes();
+        let compare = compile_cs(&warp.device, &crate::host::card_shader(CARD_COMPARE, piece_bytes)).expect("the card compare must compile on WARP");
+        let fetch = compile_cs(&warp.device, &crate::host::card_shader(CARD_FETCH, piece_bytes)).expect("the card fetch must compile on WARP");
         const PIECES: u32 = 3;
         // The copy starts 40 bytes into its piece 0: piece 0 is short, the
         // others straddle title pieces and start off a multiple of 16.

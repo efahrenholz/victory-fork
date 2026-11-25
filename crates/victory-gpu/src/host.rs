@@ -1639,14 +1639,13 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// Give both shader compilations the same piece size as the CPU plan.
-pub(crate) fn card_shader(source: &str) -> String {
-    format!("#define CARD_PIECE_BYTES {}u\n{source}", crate::shadow::card_piece_bytes())
+pub(crate) fn card_shader(source: &str, bytes: usize) -> String {
+    format!("#define CARD_PIECE_BYTES {bytes}u\n{source}")
 }
 
-
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
+/// its bytes from before, one thread per card piece (aligned in title
+/// memory as `Shadow::card_piece` cuts them): `differs`
 /// gets a dword per piece, 1 where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
@@ -3971,7 +3970,7 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let source = card_shader(CARD_COMPARE);
+        let source = card_shader(CARD_COMPARE, crate::shadow::card_piece_bytes());
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
@@ -4031,7 +4030,7 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<CardInflight> {
-            let source = card_shader(CARD_FETCH);
+            let source = card_shader(CARD_FETCH, crate::shadow::card_piece_bytes());
             let mut code: Option<ID3DBlob> = None;
             // SAFETY: the source and names live through the call; the out
             // pointer is ours.
@@ -4271,7 +4270,7 @@ impl Host {
                         };
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
+                        // of each card piece. The pieces just sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.

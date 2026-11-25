@@ -309,7 +309,7 @@ pub(crate) fn card_piece_bytes() -> usize {
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
+/// for each card piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / card_piece_bytes() as u64 + 2) * 16
@@ -579,9 +579,9 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
-/// card takes it: its offsets in the copy, its first card piece (pieces
-/// are cut at multiples of `card_piece_bytes()` of title memory; piece 0 holds offset
-/// 0), how many pieces hold it, and where the copy starts in piece 0.
+/// card takes it: its offsets in the copy, the first piece and number
+/// of pieces, and where the copy starts in piece 0. Pieces align to
+/// multiples of [`card_piece_bytes`] in title memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CardSpan {
     pub(crate) from: u32,
