@@ -95,8 +95,8 @@ pub use inplace_probes::run_alone as inplace_probe;
 pub use arena::{title_memory_released, title_memory_section_gone};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping,
-    title_memory_written, writing as kernel_will_write,
+    kernel_write_refused, read_beside, title_memory_reading, title_memory_remapped,
+    title_memory_remapping, title_memory_written, writing as kernel_will_write,
 };
 #[cfg(windows)]
 pub fn title_memory_committed(at: usize, len: usize) {
