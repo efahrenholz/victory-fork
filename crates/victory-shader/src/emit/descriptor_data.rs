@@ -108,8 +108,13 @@ impl<'a> Lower<'a> {
                         || un.starts_with("buffer_store_format")
                     {
                         // (Unsigned integers where the access moves halves.)
-                        let halves = un.contains("_format_d16_")
-                            && used.is_some_and(|u| u.root == RootType::Table);
+                        let halves = self
+                            .table_place(&Source::Loaded { load: site, first })
+                            .is_some_and(|p| {
+                                un.contains("_format_d16_")
+                                    || (self.halves_only.contains(&p)
+                                        && self.format_load_read_as_halves(ui))
+                            });
                         (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {

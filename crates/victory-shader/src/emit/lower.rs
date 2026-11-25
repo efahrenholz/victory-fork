@@ -40,6 +40,11 @@ mod descriptor_data;
 #[path = "float64.rs"]
 mod float64;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -228,6 +233,8 @@ struct Lower<'a> {
     /// Table descriptors read or written sixteen bits a channel
     /// ([`super::HostShader::half_views`]): root parameter, dword offset.
     half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1390,6 +1397,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
+            halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2197,6 +2205,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -6481,6 +6490,22 @@ impl<'a> Lower<'a> {
         biased.then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
     }
 
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -10338,9 +10363,16 @@ impl<'a> Lower<'a> {
         // they are, as unsigned integers, and the host is told, which shows
         // the shader a 16-bit float view there as its unsigned twin
         // ([`super::HostShader::half_views`]).
-        let halves = d16 && typed && used.is_some_and(|u| u.root == RootType::Table);
-        if halves && let Some(u) = used {
-            self.half_views.insert((u.slot, u.table_offset_dwords));
+        // A format load of whole dwords whose every use reads one half of a
+        // result as a half float moves 16-bit integers too (the head
+        // program's reads of the face network's output), where every
+        // access through its view does ([`Self::places_read_as_halves`]).
+        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
+            d16 || (self.halves_only.contains(p) && self.format_load_read_as_halves(inst))
+        });
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
         }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
@@ -10661,12 +10693,15 @@ impl<'a> Lower<'a> {
             if halves {
                 let h = self.handle(site, src, false, (10 | u, 0x405))?;
                 let i32t = self.s.t.i32;
-                let ret = self
-                    .s
-                    .m
-                    .named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
-                self.s
-                    .op(c, "bufferLoad.i32", Attr::ReadOnly, ret, 68, &[h, index, iu])
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s.op(
+                    c,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    ret,
+                    68,
+                    &[h, index, iu],
+                )
             } else {
                 let h = self.handle(site, src, false, (10 | u, 0x409))?;
                 self.s.op(
@@ -10756,7 +10791,8 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            // (Integers already where the load moved halves.)
+            let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
