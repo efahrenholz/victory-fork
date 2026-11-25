@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -525,8 +525,17 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 const PAGE: usize = 64 << 10;
 
 /// A section of physical pages: its handle, whether made committed (its views
-/// need no commit of their own), its bytes, and its whole view ([`Section::whole`]).
-struct Section(HANDLE, bool, usize, std::sync::OnceLock<Option<Whole>>);
+/// need no commit of their own), its bytes, its whole view ([`Section::whole`]),
+/// and per-page committed bits for [`lean_remaps`].
+struct Section {
+    handle: HANDLE,
+    precommitted: bool,
+    bytes: usize,
+    whole: std::sync::OnceLock<Option<Whole>>,
+    /// With [`lean_remaps`]: one bit a page, set once a view of ours has
+    /// committed it.
+    committed: Box<[AtomicU64]>,
+}
 
 /// A view of all of a section, mapped the first time a write of ours needs
 /// it and kept until the section goes ([`View::map`]), with the section's
@@ -553,23 +562,39 @@ fn whole_views() -> bool {
 }
 
 impl Section {
+    fn with_pool(handle: HANDLE, precommitted: bool, bytes: usize) -> Section {
+        let pages = bytes.div_ceil(PAGE);
+        Section {
+            handle,
+            precommitted,
+            bytes,
+            whole: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(handle: HANDLE, pages: usize) -> Section {
+        Self::with_pool(handle, false, pages * PAGE)
+    }
+
     /// The section's whole view, mapped on first use; `None` if switched
     /// off or the host will not map it (then a view per write).
     fn whole(&self) -> Option<&Whole> {
-        self.3
+        self.whole
             .get_or_init(|| {
                 use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
-                if !whole_views() || self.2 == 0 {
+                if !whole_views() || self.bytes == 0 {
                     return None;
                 }
                 // SAFETY: a section we own; the view is ours until `Whole` drops.
-                let at = unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, self.2) };
+                let at = unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.bytes) };
                 if at.Value.is_null() {
                     let error = std::io::Error::last_os_error();
-                    tracing::warn!(bytes = self.2, %error, "a whole view of physical pages could not be mapped; a view per write");
+                    tracing::warn!(bytes = self.bytes, %error, "a whole view of physical pages could not be mapped; a view per write");
                     return None;
                 }
-                let words = (self.2 / PAGE).div_ceil(64);
+                let words = (self.bytes / PAGE).div_ceil(64);
                 Some(Whole {
                     at: at.Value as usize,
                     committed: (0..words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
@@ -588,9 +613,9 @@ impl Drop for Section {
     fn drop(&mut self) {
         // The GPU side's heap on it, if any, goes when what is in place in
         // it does.
-        victory_gpu::title_memory_section_gone(self.0 as usize);
+        victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -664,7 +689,53 @@ impl Slice {
     fn key(&self, k: usize) -> (usize, usize) {
         (Arc::as_ptr(&self.section) as usize, self.index + k)
     }
+
+    /// Whether this page and the `n - 1` after it were committed through a
+    /// view of ours ([`lean_remaps`]).
+    fn committed(&self, n: usize) -> bool {
+        (self.index..self.index + n).all(|i| {
+            self.section
+                .committed
+                .get(i / 64)
+                .is_some_and(|w| w.load(Ordering::Relaxed) & 1 << (i % 64) != 0)
+        })
+    }
+
+    /// Notes this page and the `n - 1` after it committed.
+    fn note_committed(&self, n: usize) {
+        for i in self.index..self.index + n {
+            if let Some(w) = self.section.committed.get(i / 64) {
+                w.fetch_or(1 << (i % 64), Ordering::Relaxed);
+            }
+        }
+    }
 }
+
+/// Whether a page mapping skips the kernel calls that change nothing
+/// (`VICTORY_REMAP_LEAN=1`; off by default). Each page the title remaps
+/// (`map_alias`, some 850 a frame that streams) took four calls that each
+/// hold the process's address space: the view taken away, the placeholder
+/// split around the range, the view mapped, its pages committed. The split
+/// fails every time when the placeholder is already the range (as the
+/// title's one-page remaps leave it: 10,200 of 10,200 in a measurement),
+/// and committing a section page a second time changes nothing. With the
+/// switch the view is mapped first and the placeholder split only if that
+/// fails, and pages committed once are not committed again: two calls a
+/// remap. Measured outside the title on an i5-12400F, 850 one-page remaps:
+/// 5.0 -> 3.0 us a remap alone, 19.9 -> 9.6 us beside a thread asking the
+/// write watch of 1 GiB.
+/// shortcut: a page the title itself decommits through one of its views
+/// (`VirtualFree` with `MEM_DECOMMIT`, passed through to the host) would
+/// still be noted committed, and a later view of it would fault on first
+/// touch; no title is known to do that with physical pages.
+fn lean_remaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_LEAN").is_some_and(|v| v == "1"))
+}
+
+/// Since the start, with [`lean_remaps`]: placeholder splits and commits
+/// skipped; logged now and then.
+static LEAN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 #[derive(Default)]
 struct Physical {
@@ -737,7 +808,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         // For the GPU side: only a committed section can be opened as a
         // host heap.
         victory_gpu::title_memory_section(handle as usize, bytes as u64, committed);
-        sections.push(Arc::new(Section(handle, committed, bytes, std::sync::OnceLock::new())));
+        sections.push(Arc::new(Section::with_pool(handle, committed, bytes)));
         made += bytes;
     }
     tracing::debug!(
@@ -800,13 +871,13 @@ impl View {
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         if let Some(whole) = slice.section.whole()
             && slice.index + n <= whole.committed.len() * 64
-            && offset as usize + len <= slice.section.2
+            && offset as usize + len <= slice.section.bytes
         {
             let at = whole.at + offset as usize;
             let pages = slice.index..slice.index + n;
             let bit = |p: usize| 1u64 << (p % 64);
             if !pages.clone().all(|p| whole.committed[p / 64].load(Relaxed) & bit(p) != 0) {
-                if !commit(at, len, slice.section.1) {
+                if !commit(at, len, slice.section.precommitted) {
                     return None;
                 }
                 for p in pages {
@@ -822,7 +893,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -833,7 +904,7 @@ impl View {
             return None;
         }
         let view = View { at, len, whole: None };
-        commit(at.Value as usize, len, slice.section.1).then_some(view)
+        commit(at.Value as usize, len, slice.section.precommitted).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -1186,17 +1257,12 @@ fn map_logged(
     log: bool,
     commitment: PageCommitment,
 ) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
+    let lean = lean_remaps();
+    // SAFETY: maps the section in place of the placeholder that is exactly
+    // the range (failing, and changing nothing, if it is not).
+    let map_view = || unsafe {
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -1206,6 +1272,29 @@ fn map_logged(
             std::ptr::null_mut(),
             0,
         )
+    };
+    // SAFETY: splits the placeholder around the range (failing harmlessly
+    // when the range is the whole placeholder); acts only on placeholders.
+    let split = || unsafe {
+        VirtualFree(
+            base as *mut c_void,
+            len,
+            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+        );
+    };
+    let view = if lean {
+        // The view first: the placeholder is usually the range already.
+        let view = map_view();
+        if view.Value as usize == base {
+            LEAN[0].fetch_add(1, Ordering::Relaxed);
+            view
+        } else {
+            split();
+            map_view()
+        }
+    } else {
+        split();
+        map_view()
     };
     if view.Value as usize != base {
         if !log {
@@ -1219,15 +1308,32 @@ fn map_logged(
         );
         return false;
     }
-    if matches!(commitment, PageCommitment::Required) && !commit(base, len, slice.section.1) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    if matches!(commitment, PageCommitment::Required) {
+        let pages = len.div_ceil(PAGE);
+        if lean && (slice.section.precommitted || slice.committed(pages)) {
+            let skipped = LEAN[1].fetch_add(1, Ordering::Relaxed) + 1;
+            if skipped.is_multiple_of(1 << 16) {
+                tracing::info!(
+                    splits_skipped = LEAN[0].load(Ordering::Relaxed),
+                    commits_skipped = skipped,
+                    "page mappings without the kernel calls that change nothing (VICTORY_REMAP_LEAN=1), since the start"
+                );
+            }
+        } else {
+            if !commit(base, len, slice.section.precommitted) {
+                // SAFETY: the view just mapped, back to a placeholder.
+                unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+                return false;
+            }
+            if lean {
+                slice.note_committed(pages);
+            }
+        }
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1471,6 +1577,25 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_section_notes_the_pages_committed_through_it() {
+        // 130 pages: three words of bits, the last one partly used
+        let section = Arc::new(Section::new(std::ptr::null_mut(), 130));
+        let at = |index| Slice { section: section.clone(), index };
+        assert!(!at(0).committed(1));
+        at(62).note_committed(4); // 62..66, across the first word's end
+        assert!(at(62).committed(4));
+        assert!(at(63).committed(3));
+        assert!(!at(61).committed(2), "61 was not");
+        assert!(!at(62).committed(5), "66 was not");
+        at(127).note_committed(3); // the last three
+        assert!(at(127).committed(3));
+        assert!(!at(127).committed(4), "past the end is never committed");
+        // a new section of the same pages starts clear
+        let fresh = Slice { section: Arc::new(Section::new(std::ptr::null_mut(), 130)), index: 62 };
+        assert!(!fresh.committed(1));
+    }
     use super::*;
 
     /// R9's wrappers count the title's calls on graphics memory only, and
