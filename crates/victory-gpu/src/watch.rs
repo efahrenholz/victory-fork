@@ -1065,7 +1065,11 @@ fn absent_once() -> bool {
 /// 1 to 1000.
 fn absent_keep_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| std::env::var("VICTORY_ABSENT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(100, |n| n.clamp(1, 1000)))
+    *MS.get_or_init(|| match std::env::var("VICTORY_ABSENT_MS").as_deref().map(str::trim) {
+        Ok("told") => u64::MAX,
+        Ok(v) => v.parse::<u64>().map_or(100, |n| n.clamp(1, 1000)),
+        Err(_) => 100,
+    })
 }
 
 /// Since they were last taken ([`absent_looks`]): questions to Windows
@@ -1855,8 +1859,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// written. A commit no one tells of is found at the next look at the
 /// parked blocks that are no placeholder ([`Guards::parked`]).
 pub fn title_memory_committed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    if !g.verified.is_empty() {
+        let noted: Vec<usize> = g.verified.range(range.clone()).map(|(&block, _)| block).collect();
+        for block in noted {
+            g.verified.remove(&block);
+        }
+    }
     let parked: Vec<usize> = g.parked.range(range.clone()).copied().collect();
     for block in parked {
         g.parked.remove(&block);

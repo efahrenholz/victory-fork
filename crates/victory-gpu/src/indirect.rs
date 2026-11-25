@@ -477,7 +477,7 @@ fn record_clamp_with(
     (kind, stride, records): (u32, u32, u32),
     (ahead, split): (bool, bool),
 ) -> bool {
-    record_clamp_full(c, l, (dst, before), None, budget, (src, src_offset), count, (kind, stride, records), ahead)
+    record_clamp_full(c, l, (dst, before), None, budget, (src, src_offset), count, (kind, stride, records), (ahead, split))
 }
 
 /// [`record_clamp_as`]; with `hoisted_dst`, the clamp writes at that offset
@@ -493,7 +493,7 @@ fn record_clamp_full(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    ahead: bool,
+    (ahead, split): (bool, bool),
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -959,7 +959,7 @@ pub(crate) fn bound_before(
     let (c, budget) = (clamp()?, h.clamps.budget()?);
     let (buffer, at) = h.room(bytes)?;
     let list = &h.clamps.list;
-    record_clamp_full(c, list, (&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), Some(at), budget, src, count, spec, false)
+    record_clamp_full(c, list, (&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), Some(at), budget, src, count, spec, (false, false))
         .then_some((buffer, at))
 }
 
