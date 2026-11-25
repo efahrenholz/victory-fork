@@ -8416,7 +8416,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let write = |at: usize, n: usize| {
         write(at, n) || (crate::watch::kernel_write_refused(at, n) && write(at, n))
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || crate::plaincopy::write(dst, src, len) || write(dst as usize, len) { 
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
