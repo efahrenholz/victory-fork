@@ -1832,6 +1832,16 @@ impl HostHeap {
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_opts(index, view, seen, true)
+    }
+
+    fn note_buffer_opts(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        record_change: bool,
+    ) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -1909,7 +1919,7 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        if was && record_change {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2202,14 +2212,14 @@ impl HostHeap {
                 for part in to_mirror.chunks(chunk) {
                     s.spawn(move || {
                         for &(idx, handle) in part {
-                            self.mirror_inner(idx, handle, false, false);
+                            self.mirror_inner(idx, handle, false, false, true);
                         }
                     });
                 }
             });
         } else {
             for &(idx, handle) in to_mirror {
-                self.mirror_inner(idx, handle, false, false);
+                self.mirror_inner(idx, handle, false, false, true);
             }
         }
     }
@@ -2238,7 +2248,7 @@ impl HostHeap {
             }
         }
         self.copied[index as usize].store(print, Ordering::Relaxed);
-        self.mirror_inner(index, handle, false, false);
+        self.mirror_inner(index, handle, false, false, true);
         true
     }
 
@@ -2261,7 +2271,14 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_inner(index, handle, for_draw, true)
+        self.mirror_inner(index, handle, for_draw, true, true)
+    }
+
+    /// [`HostHeap::mirror`] for the `heap_buffers` pass (`draw.rs`): passes
+    /// `record_change = false` so slots just popped from `buffer_changes()` are
+    /// not immediately re-queued into `self.changed` for the next frame.
+    pub(crate) fn mirror_heap_buffer(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_inner(index, handle, true, true, false)
     }
 
     /// Shared implementation of [`HostHeap::mirror`] and
@@ -2273,6 +2290,7 @@ impl HostHeap {
         handle: u64,
         for_draw: bool,
         invalidate_copied: bool,
+        record_change: bool,
     ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -2352,7 +2370,7 @@ impl HostHeap {
                         // Views of other textures in the memory this one describes
                         // are stale: collect them and unmake after releasing this
                         // stripe lock so no two stripes are ever held together.
-                        for stale in self.note_buffer(index, Some(&view), for_draw) {
+                        for stale in self.note_buffer_opts(index, Some(&view), for_draw, record_change) {
                             if stale != index {
                                 stale_to_unmake.push(stale);
                             }

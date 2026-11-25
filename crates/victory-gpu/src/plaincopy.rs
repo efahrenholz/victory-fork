@@ -307,19 +307,8 @@ pub(crate) fn copy_buffer(to: *mut u8, from: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
-        return false;
-    }
-    let whole = guarded(to, from, len);
-    if whole {
-        COUNT[0].fetch_add(1, Relaxed);
-        COUNT[1].fetch_add(len as u64, Relaxed);
-    } else {
-        COUNT[2].fetch_add(1, Relaxed);
-        note_fault(from as usize, len);
-    }
-    whole
+    expire_recent_faults();
+    copy_unless_recent_fault(to, from, len, &RECENT)
 }
 
 /// With the frame line: what [`copy`] did per frame over `frames`.

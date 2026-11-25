@@ -1801,7 +1801,7 @@ impl State {
             let Some(handle) = handle else {
                 return (index, None);
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(view) = host.mirror_heap_buffer(index, handle) else {
                 return (index, None);
             };
             // The copy the slot shows (`buffer_copy`), not the one the
