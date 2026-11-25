@@ -214,12 +214,46 @@ pub(crate) fn sync_heaps() {
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
+                    // Compare against the page's last-seen bytes in place (no
+                    // per-page allocation): skip pages whose bytes did not
+                    // change and narrow the slot check to the changed span.
+                    // `VICTORY_HEAP_SYNC_DIFF=0` disables page diffing.
+                    let (moved_from, moved_to) = if page_diff() {
+                        let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(old) = seen.get_mut(&from) {
+                            let Some(span) = difference(old, &page_bytes) else {
+                                page += crate::watch::PAGE;
+                                continue;
+                            };
+                            if old.len() == page_bytes.len() {
+                                old.copy_from_slice(&page_bytes);
+                            } else {
+                                *old = page_bytes.clone();
+                            }
+                            span
+                        } else {
+                            if seen.len() >= 4096 {
+                                seen.clear();
+                            }
+                            seen.insert(from, page_bytes.clone());
+                            (0, page_bytes.len())
+                        }
+                    } else {
+                        (0, page_bytes.len())
+                    };
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    let moved = changed_slots(
+                        from + moved_from,
+                        from + moved_to,
+                        start as usize,
+                        step,
+                        mirrored_count,
+                    );
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(slots, moved, (start, step), from, &page_bytes);
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -289,6 +323,81 @@ fn page_at_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
 
+/// Whether [`sync_heaps`] skips pages whose bytes match the copy last read and
+/// narrows [`HostHeap::mirror_copied_page`] to the changed byte span. On by
+/// default; `VICTORY_HEAP_SYNC_DIFF=0` disables it.
+#[cfg(windows)]
+fn page_diff() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_DIFF").is_none_or(|v| v != "0"))
+}
+
+/// Last-seen bytes of each changed heap page (keyed by page start address),
+/// updated in place to avoid per-frame allocations.
+#[cfg(windows)]
+fn seen_pages() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// First and exclusive last byte offsets where `old` and `now` differ, or
+/// `None` when identical. Scans 8-byte chunks first so equal 64 KiB pages
+/// reject in a few microseconds.
+#[cfg(any(windows, test))]
+fn difference(old: &[u8], now: &[u8]) -> Option<(usize, usize)> {
+    if old.len() != now.len() {
+        return Some((0, now.len()));
+    }
+    let len = old.len();
+    let chunks = len / 8;
+    let mut first_chunk = 0;
+    while first_chunk < chunks {
+        let off = first_chunk * 8;
+        if old[off..off + 8] != now[off..off + 8] {
+            break;
+        }
+        first_chunk += 1;
+    }
+    let first = if first_chunk < chunks {
+        let off = first_chunk * 8;
+        off + old[off..off + 8]
+            .iter()
+            .zip(&now[off..off + 8])
+            .position(|(a, b)| a != b)
+            .unwrap_or(0)
+    } else {
+        let off = chunks * 8;
+        off + old[off..]
+            .iter()
+            .zip(&now[off..])
+            .position(|(a, b)| a != b)?
+    };
+    let tail_diff = old[chunks * 8..]
+        .iter()
+        .zip(&now[chunks * 8..])
+        .rposition(|(a, b)| a != b);
+    let last = if let Some(d) = tail_diff {
+        chunks * 8 + d
+    } else {
+        let mut last_chunk = chunks;
+        while last_chunk > first_chunk {
+            last_chunk -= 1;
+            let off = last_chunk * 8;
+            if old[off..off + 8] != now[off..off + 8] {
+                let d = old[off..off + 8]
+                    .iter()
+                    .zip(&now[off..off + 8])
+                    .rposition(|(a, b)| a != b)
+                    .unwrap_or(7);
+                return Some((first, off + d + 1));
+            }
+        }
+        first
+    };
+    Some((first, last + 1))
+}
+
 /// Title descriptor slots in a changed byte range that have host counterparts.
 /// `range_end` is exclusive.
 #[cfg(windows)]
@@ -324,7 +433,20 @@ impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        let mut removed = Vec::new();
+        heaps.retain(|&(start, end, h)| {
+            if h == at {
+                removed.push((start as usize, end as usize));
+                false
+            } else {
+                true
+            }
+        });
+        drop(heaps);
+        if !removed.is_empty() {
+            let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
+            seen.retain(|&addr, _| !removed.iter().any(|&(s, e)| addr >= s && addr < e));
+        }
     }
 }
 
@@ -1445,5 +1567,43 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(test)]
+mod page_diff_tests {
+    use super::difference;
+
+    #[test]
+    fn equal_pages_return_none() {
+        let a = vec![0x5Au8; 65536];
+        let b = a.clone();
+        assert_eq!(difference(&a, &b), None);
+        assert_eq!(difference(&[1, 2, 3], &[1, 2, 3]), None);
+        assert_eq!(difference(&[], &[]), None);
+    }
+
+    #[test]
+    fn finds_exact_changed_span_across_words_and_tail() {
+        let a = vec![0u8; 67];
+        let mut b = a.clone();
+        b[13] = 1;
+        assert_eq!(difference(&a, &b), Some((13, 14)));
+        b[65] = 2;
+        assert_eq!(difference(&a, &b), Some((13, 66)));
+
+        let mut c = a.clone();
+        c[64] = 9;
+        assert_eq!(difference(&a, &c), Some((64, 65)));
+
+        let mut d = a.clone();
+        d[0] = 7;
+        d[66] = 8;
+        assert_eq!(difference(&a, &d), Some((0, 67)));
+    }
+
+    #[test]
+    fn length_mismatch_returns_full_new_span() {
+        assert_eq!(difference(&[1, 2], &[1, 2, 3, 4]), Some((0, 4)));
     }
 }

@@ -1868,6 +1868,7 @@ impl HostHeap {
     pub(crate) fn mirror_copied_page(
         &self,
         slots: std::ops::Range<u64>,
+        moved: std::ops::Range<u64>,
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
@@ -1881,6 +1882,15 @@ impl HostHeap {
                 copied.resize(self.count as usize, 0);
             }
             for index in slots {
+                // None past the host heap's slots, as `mirror_copied`.
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                // Records outside the page's modified byte span are unchanged
+                // unless nothing has been mirrored at that slot yet (`*last == 0`).
+                if (index < moved.start || index >= moved.end) && *last != 0 {
+                    continue;
+                }
                 let handle = start + index * step;
                 // A record that straddles the range's ends is left to the
                 // range that holds its first byte.
@@ -1891,10 +1901,6 @@ impl HostHeap {
                     continue;
                 };
                 looked += 1;
-                // None past the host heap's slots, as `mirror_copied`.
-                let Some(last) = copied.get_mut(index as usize) else {
-                    continue;
-                };
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
                 // The record last seen, or a slot never looked at that
