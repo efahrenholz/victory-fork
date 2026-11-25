@@ -220,68 +220,48 @@ pub(crate) fn sync_heaps() {
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
-                    // The kernel says the page was written; writing back the
-                    // bytes it already held is not a change. Compare the
-                    // whole page first: 64 KiB against the copy last read is
-                    // a few microseconds, and the slot walk it saves is
-                    // hundreds.
-                    // What the page held when it was last read, to say which
-                    // of its records moved. The kernel marks a page written
-                    // whether or not the bytes changed, and the title keeps
-                    // thousands of records in these pages.
-                    let before = {
+                    // Compare whole 64 KiB page against last seen bytes without
+                    // reallocating, find the changed byte span in O(N) words,
+                    // then filter + mirror the page under a single `copied` lock.
+                    let (moved_from, moved_to) = {
                         let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
-                        if seen.get(&from).is_some_and(|old| old.as_slice() == page_bytes.as_slice()) {
-                            page += crate::watch::PAGE;
-                            continue;
+                        if let Some(old) = seen.get_mut(&from) {
+                            let Some(span) = difference(old, &page_bytes) else {
+                                page += crate::watch::PAGE;
+                                continue;
+                            };
+                            if old.len() == page_bytes.len() {
+                                old.copy_from_slice(&page_bytes);
+                            } else {
+                                *old = page_bytes.clone();
+                            }
+                            span
+                        } else {
+                            if seen.len() >= 4096 {
+                                seen.clear();
+                            }
+                            seen.insert(from, page_bytes.clone());
+                            (0, page_bytes.len())
                         }
-                        if seen.len() >= 4096 {
-                            seen.clear();
-                        }
-                        seen.insert(from, page_bytes.clone())
                     };
-                    // The bytes that differ, and so the records that can have
-                    // changed: a ring of records in one page usually moves a
-                    // handful of them. Records outside that span are the ones
-                    // last mirrored, unless nothing was mirrored there yet.
-                    let (moved_from, moved_to) = match &before {
-                        Some(old) => difference(old, &page_bytes).unwrap_or((0, page_bytes.len())),
-                        None => (0, page_bytes.len()),
-                    };
-                    let mut slots = changed_slots(
+                    let all = changed_slots(from, to, start as usize, step, mirrored_count);
+                    let moved = changed_slots(
                         from + moved_from,
                         from + moved_to,
                         start as usize,
                         step,
                         mirrored_count,
-                    )
-                    .collect::<Vec<u64>>();
-                    if moved_from != 0 || moved_to != page_bytes.len() {
-                        let all = changed_slots(from, to, start as usize, step, mirrored_count);
-                        for index in all {
-                            if !slots.contains(&index) && host.needs_mirror(index as u32) {
-                                slots.push(index);
-                            }
-                        }
-                        slots.sort_unstable();
-                    }
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
+                    );
+                    let (p_looked, p_mirrored) = host.mirror_copied_page(
+                        from,
+                        &page_bytes,
+                        start,
+                        step,
+                        all,
+                        moved,
+                    );
+                    looked += p_looked;
+                    mirrored += p_mirrored;
                 }
                 page += crate::watch::PAGE;
             }
@@ -320,13 +300,58 @@ pub(crate) fn sync_line(frames: f64) {
 
 /// The first and last bytes that differ between two copies of a page, as a
 /// range whose end is exclusive: `None` when they are the same.
+/// Compares 8-byte chunks first so equal 64 KiB pages scan in ~2 us.
 #[cfg(windows)]
 fn difference(old: &[u8], now: &[u8]) -> Option<(usize, usize)> {
     if old.len() != now.len() {
         return Some((0, now.len()));
     }
-    let first = old.iter().zip(now).position(|(a, b)| a != b)?;
-    let last = old.iter().zip(now).rposition(|(a, b)| a != b)?;
+    let len = old.len();
+    let chunks = len / 8;
+    let mut first_chunk = 0;
+    while first_chunk < chunks {
+        let off = first_chunk * 8;
+        if old[off..off + 8] != now[off..off + 8] {
+            break;
+        }
+        first_chunk += 1;
+    }
+    let first = if first_chunk < chunks {
+        let off = first_chunk * 8;
+        off + old[off..off + 8]
+            .iter()
+            .zip(&now[off..off + 8])
+            .position(|(a, b)| a != b)
+            .unwrap_or(0)
+    } else {
+        let off = chunks * 8;
+        off + old[off..]
+            .iter()
+            .zip(&now[off..])
+            .position(|(a, b)| a != b)?
+    };
+    let tail_diff = old[chunks * 8..]
+        .iter()
+        .zip(&now[chunks * 8..])
+        .rposition(|(a, b)| a != b);
+    let last = if let Some(d) = tail_diff {
+        chunks * 8 + d
+    } else {
+        let mut last_chunk = chunks;
+        while last_chunk > first_chunk {
+            last_chunk -= 1;
+            let off = last_chunk * 8;
+            if old[off..off + 8] != now[off..off + 8] {
+                let d = old[off..off + 8]
+                    .iter()
+                    .zip(&now[off..off + 8])
+                    .rposition(|(a, b)| a != b)
+                    .unwrap_or(7);
+                return Some((first, off + d + 1));
+            }
+        }
+        first
+    };
     Some((first, last + 1))
 }
 

@@ -1867,6 +1867,76 @@ impl HostHeap {
         copied.get(index as usize).is_none_or(|print| *print == 0)
     }
 
+    /// Page-batched version of [`HostHeap::mirror_copied`]: filters every slot
+    /// in `all` under a single `self.copied` lock (skipping slots outside
+    /// `moved` whose fingerprint is already non-zero, and using lock-free
+    /// `made_keys` for zero-record checks), then calls `mirror_inner` only for
+    /// slots that actually changed. Returns `(looked, mirrored)`.
+    pub(crate) fn mirror_copied_page(
+        &self,
+        from: usize,
+        page_bytes: &[u8],
+        start: u64,
+        step: u64,
+        all: std::ops::Range<u64>,
+        moved: std::ops::Range<u64>,
+    ) -> (u64, u64) {
+        let mut looked = 0u64;
+        let mut tabled = 0u64;
+        let sync_all_tables = sync_tables();
+        let frame = crate::frame::current();
+        let step_usize = step as usize;
+        let mut to_mirror: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in all {
+                let idx = index as u32;
+                if idx >= self.count {
+                    break;
+                }
+                let in_moved = index >= moved.start && index < moved.end;
+                let last_val = copied[idx as usize];
+                if !in_moved && last_val != 0 {
+                    continue;
+                }
+                let handle = start + index * step;
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page_bytes.get(at..at + step_usize) else {
+                    continue;
+                };
+                looked += 1;
+                if !sync_all_tables && self.tabled_lately(idx, frame) {
+                    tabled += 1;
+                    continue;
+                }
+                let print = record_print(record) | 1;
+                if last_val == print {
+                    continue;
+                }
+                if last_val == 0 && record.iter().all(|&b| b == 0) {
+                    if self.made_keys[idx as usize].load(Ordering::Acquire) == 0 {
+                        continue;
+                    }
+                }
+                copied[idx as usize] = print;
+                to_mirror.push((idx, handle));
+            }
+        }
+        if tabled > 0 {
+            COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mirrored = to_mirror.len() as u64;
+        for (idx, handle) in to_mirror {
+            self.mirror_inner(idx, handle, false, false);
+        }
+        (looked, mirrored)
+    }
+
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
         if index >= self.count {
             return false;
