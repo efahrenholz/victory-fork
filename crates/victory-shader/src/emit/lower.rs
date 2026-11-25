@@ -2422,6 +2422,15 @@ impl<'a> Lower<'a> {
                 return Val::I32(v);
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            // The host's group id plus the dispatch's first group in x
+            // (`shader.rs` `USER_GROUP_BASE`).
+            Input::GroupId(0) => {
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             // Bits 0-5 the group's console waves, 6-11 this wave's index
             // among them (as Mesa reads `tg_size`).
