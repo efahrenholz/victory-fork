@@ -1754,6 +1754,14 @@ mod host {
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
+        static ANYWHERE: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var("VICTORY_KEYS_ANYWHERE")
+                .ok()
+                .is_some_and(|v| !v.is_empty() && v != "0")
+        });
+        if *ANYWHERE {
+            return true;
+        }
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
