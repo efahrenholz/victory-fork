@@ -37,7 +37,7 @@ pub(crate) struct HostHeap {
     /// Per slot, `crate::resident::generation` when it was last looked at
     /// for showing a buffer no table hands out any more (taken under
     /// `made`'s lock).
-    checked: Mutex<Vec<u32>>,
+    checked: Box<[std::sync::atomic::AtomicU32]>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -101,6 +101,9 @@ pub(crate) struct HostHeap {
     /// Levels on demand (`crate::tiles`): whether any slot of this heap was
     /// made against a tiled texture (fast gate for non-tiled heaps).
     has_tiled: std::sync::atomic::AtomicBool,
+    /// Per-slot lock-free membership bit for `tiled_shown` so non-tiled
+    /// slots skip locking `tiled_shown` in the hot descriptor lookup path.
+    tiled_slot: Box<[std::sync::atomic::AtomicBool]>,
     /// Levels on demand: slots currently backed by a tiled texture, their
     /// optional placed start address (including tabled slots excluded from
     /// `placed`), and the `first_shown` level baked into each host descriptor.
@@ -1090,7 +1093,10 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             made_keys: (0..count).map(|_| AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
-            checked: Mutex::new(vec![0; count as usize]),
+            checked: (0..count as usize)
+                .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1113,6 +1119,10 @@ impl HostHeap {
                 spans
             },
             has_tiled: std::sync::atomic::AtomicBool::new(false),
+            tiled_slot: (0..count as usize)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             tiled_shown: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -1570,6 +1580,9 @@ impl HostHeap {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .note(slot, placed_start(view), on_demand, shown);
+                if let Some(flag) = self.tiled_slot.get(slot as usize) {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
                 self.has_tiled.store(true, Relaxed);
             }
             None => self.forget_tiled(slot),
@@ -1580,6 +1593,11 @@ impl HostHeap {
         if !self.has_tiled.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        if let Some(flag) = self.tiled_slot.get(slot as usize) {
+            if !flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+        }
         self.tiled_shown
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1589,6 +1607,11 @@ impl HostHeap {
     fn tiled_stale(&self, slot: u32) -> bool {
         if !self.has_tiled.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
+        }
+        if let Some(flag) = self.tiled_slot.get(slot as usize) {
+            if !flag.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
         }
         self.tiled_shown
             .lock()
@@ -2222,11 +2245,15 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        // Fast path: slot already holds this exact made descriptor and is not
-        // a stale tiled on-demand view (skip when resident replacement check is
-        // active on a draw).
+        // Lock-free fast path: slot already holds this exact made descriptor,
+        // matches the current resident generation (if residents are active on
+        // a draw), and is not a stale tiled on-demand texture view.
+        let res_ok = !for_draw
+            || !crate::resident::on()
+            || self.checked[index as usize].load(Ordering::Relaxed)
+                == crate::resident::generation() as u32;
         if tag == VIEW_TAG
-            && !(for_draw && crate::resident::on())
+            && res_ok
             && self.made_keys[index as usize].load(Ordering::Acquire) == key
             && !self.tiled_stale(index)
             && let Some(view) = view_at(i, generation)
@@ -2262,10 +2289,7 @@ impl HostHeap {
                     // one handed out now.
                     if for_draw && made[index as usize] == key && crate::resident::on() {
                         let now = crate::resident::generation() as u32;
-                        let mut checked = self.checked.lock().unwrap_or_else(|e| e.into_inner());
-                        if checked[index as usize] != now {
-                            checked[index as usize] = now;
-                            drop(checked);
+                        if self.checked[index as usize].swap(now, Ordering::Relaxed) != now {
                             let replaced = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
                                 .as_ref()
                                 .is_some_and(crate::resident::was_replaced);
@@ -2331,6 +2355,10 @@ impl HostHeap {
                             self.record_tiled(index, &view, tiled);
                             self.keep(index, kept);
                             if new_key != 0 {
+                                self.checked[index as usize].store(
+                                    crate::resident::generation() as u32,
+                                    Ordering::Relaxed,
+                                );
                                 self.made_keys[index as usize].store(new_key, Ordering::Release);
                             }
                             Some(view)
