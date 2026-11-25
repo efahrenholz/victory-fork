@@ -132,6 +132,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address ([`stores_by_address`]):
+    /// only then are the host's copies of that memory compared after it.
+    pub(crate) address_stores: bool,
     /// Compute thread-group dimensions `[x, y, z]` (`[0; 3]` for non-compute).
     pub(crate) threads: [u32; 3],
     /// The narrowest buffer store its code has ([`store_width`]).
@@ -216,6 +219,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let address_stores = programs.is_empty() || programs.iter().any(stores_by_address);
     let store_counts = programs.iter().map(store_counts).fold([0; 4], |a, b| std::array::from_fn(|i| a[i] + b[i]));
     let width = if programs.is_empty() { StoreWidth::Bytes } else { programs.iter().map(store_width).max().unwrap_or_default() };
     let main = programs.into_iter().find(|p| {
@@ -233,6 +237,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         host,
         used,
         stores,
+        address_stores,
         threads,
         width,
         store_counts,
@@ -568,6 +573,32 @@ mod width_tests {
         assert_eq!(w(&[(Encoding::Mubuf, None)]), StoreWidth::Bytes);
         assert_eq!(w(&[(Encoding::Sop1, Some("s_setpc_b64"))]), StoreWidth::Bytes);
     }
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a flat, global or scalar-memory store or atomic (the
+/// accesses that take a raw address), or code that is not all known, as in
+/// [`stores`]. The programs that walk the ray-tracing structures read them
+/// by address and store their results through views: before this, each of
+/// their dispatches declared every numbered copy of title memory written,
+/// which with the structure builder running was 12 GB snapshotted and
+/// compared on the CPU a frame (3030 ranges of 4 MiB).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
 }
 
 #[repr(C)]
