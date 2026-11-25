@@ -221,6 +221,7 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let mut to_mirror: Vec<(u32, u64)> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -232,9 +233,6 @@ pub(crate) fn sync_heaps() {
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
-                    // Compare whole 64 KiB page against last seen bytes without
-                    // reallocating, find the changed byte span in O(N) words,
-                    // then filter + mirror the page under a single `copied` lock.
                     let (moved_from, moved_to) = {
                         let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(old) = seen.get_mut(&from) {
@@ -264,19 +262,22 @@ pub(crate) fn sync_heaps() {
                         step,
                         mirrored_count,
                     );
-                    let (p_looked, p_mirrored) = host.mirror_copied_page(
+                    looked += host.scan_copied_page(
                         from,
                         &page_bytes,
                         start,
                         step,
                         all,
                         moved,
+                        &mut to_mirror,
                     );
-                    looked += p_looked;
-                    mirrored += p_mirrored;
                 }
                 page += crate::watch::PAGE;
             }
+        }
+        if !to_mirror.is_empty() {
+            mirrored += to_mirror.len() as u64;
+            host.mirror_copied_batch(&to_mirror);
         }
     }
     drop(heaps);
