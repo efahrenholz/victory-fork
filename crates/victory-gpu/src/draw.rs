@@ -445,6 +445,16 @@ pub(crate) fn window_line(frames: f64) {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// With `crate::indirect::hoisting`: the open host list before this
+    /// one's that takes the clamps of the run of indirect draws recorded now.
+    pub(crate) hoist: Option<crate::indirect::Hoist>,
+    /// Title commands recorded that may write indirect arguments
+    /// (dispatches, copies, resolves, memory writes, draws whose shaders
+    /// store): a run of hoisted clamps ends at the next one.
+    pub(crate) writes: u64,
+    /// The budget the pieces of this title list share since its first run
+    /// of hoisted clamps (`crate::host::HostList::lend_budget`).
+    pub(crate) budget_of: Option<(ID3D12Resource, bool)>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -2567,6 +2577,17 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// A draw whose shaders store to buffers may write the arguments of a
+    /// later draw: with hoisted clamps it ends the run (`crate::indirect::hoisting`),
+    /// as such shaders end a window (`windows`).
+    fn note_stores(&mut self) {
+        if crate::indirect::hoisting()
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.stages.iter().any(|s| s.translated().stores))
+        {
+            self.writes += 1;
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.dispatch_inner(list, x, y, z, 0);
@@ -2651,6 +2672,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
+        self.writes += 1;
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2966,6 +2988,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
+                    self.note_stores();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -3470,6 +3493,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            self.note_stores();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3573,6 +3597,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            self.note_stores();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3745,6 +3770,23 @@ impl State {
         } else {
             None
         };
+        // The run's clamps in the list before (`crate::indirect::hoisting`):
+        // nothing of ours between this list's draws.
+        let mut hoisted = None;
+        if hit.is_none()
+            && gathered.is_none()
+            && kind != DISPATCH
+            && !windowed
+            && self.topology != RECTANGLES
+            && let Some(h) = self.hoist.as_mut()
+        {
+            args.refresh(&h.clamps, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(&h.clamps, *at, 4);
+            }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            hoisted = crate::indirect::bound_before(h, (&args.buffer, offset), count_arg, (kind, stride, max));
+        }
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 #[cfg(feature = "diagnostics")]
@@ -3797,6 +3839,12 @@ impl State {
                 self.window = None;
                 args.refresh(list, arguments, len);
                 (args.buffer.clone(), offset)
+            }
+            (None, None) if hoisted.is_some() => {
+                let Some((bounded, at)) = hoisted.take() else { unreachable!() };
+                self.window = None;
+                list.keep(&bounded);
+                (bounded, at)
             }
             (None, None) => {
                 #[cfg(feature = "diagnostics")]
@@ -4006,7 +4054,11 @@ impl State {
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
+        if kind != DISPATCH {
+            self.note_stores();
+        }
         if kind == DISPATCH {
+            self.writes += 1;
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

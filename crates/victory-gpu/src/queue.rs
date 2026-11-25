@@ -300,7 +300,7 @@ fn submit_cut(this: This, lists: &[This]) {
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .flat_map(|&l| crate::list::host_runs(l))
             .collect();
         host.execute(&now);
         // They have run: their descriptor tables' slots are free again, as
@@ -384,7 +384,7 @@ fn submit_split(this: This, lists: &[This]) {
     if cut > 0 {
         let now: Vec<_> = lists[..cut]
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .flat_map(|&l| crate::list::host_runs(l))
             .collect();
         host.execute(&now);
     }
@@ -1103,7 +1103,7 @@ fn execute_now(this: This, count: u32, lists: *const This) {
         }
         let host_lists: Vec<_> = lists
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .flat_map(|&l| crate::list::host_runs(l))
             .collect();
         host.execute(&host_lists);
         crate::list::tables_done(lists);
