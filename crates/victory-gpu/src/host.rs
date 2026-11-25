@@ -7277,14 +7277,14 @@ impl HostList {
     /// A draw or dispatch being prepared writes title texture `resource`
     /// through unordered access: if it is of a kind copied back
     /// ([`crate::texback`]), the list copies it when it closes.
-    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+    pub(crate) fn texture_written(&self, resource: crate::object::This, view: Option<&[u32; 10]>) {
         if !crate::texback::wanted(resource) {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
+        if let Some(target) = deferred.back_wanted.iter_mut().find(|target| target.owner() == resource as usize) {
+            target.include(view);
+        } else if let Some(target) = crate::texback::Target::new(resource, view) {
             deferred.back_wanted.push(target);
         }
     }
