@@ -1219,13 +1219,18 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        for piece_bytes in [4 << 10, 16 << 10, 64 << 10] {
+            check_card_compare(piece_bytes);
+        }
+    }
+
+    fn check_card_compare(piece_bytes: usize) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
-        const PIECE: usize = 64 << 10;
+        let compare = compile_cs(&warp.device, &crate::host::card_shader(crate::host::CARD_COMPARE, piece_bytes)).expect("the card compare must compile on WARP");
         const PIECES: u32 = 3;
-        let size = PIECE * PIECES as usize;
+        let size = piece_bytes * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
@@ -1254,7 +1259,7 @@ void main() {
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
-        let at = PIECE + 1234;
+        let at = piece_bytes + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
@@ -1367,18 +1372,23 @@ void main() {
     /// slots is written but copies nothing.
     #[test]
     fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
+        for piece_bytes in [4 << 10, 16 << 10, 64 << 10] {
+            check_card_fetch(piece_bytes);
+        }
+    }
+
+    fn check_card_fetch(piece_bytes: usize) {
         use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("the card compare must compile on WARP");
-        let fetch = compile_cs(&warp.device, CARD_FETCH).expect("the card fetch must compile on WARP");
-        const PIECE: usize = 64 << 10;
+        let compare = compile_cs(&warp.device, &crate::host::card_shader(CARD_COMPARE, piece_bytes)).expect("the card compare must compile on WARP");
+        let fetch = compile_cs(&warp.device, &crate::host::card_shader(CARD_FETCH, piece_bytes)).expect("the card fetch must compile on WARP");
         const PIECES: u32 = 3;
         // The copy starts 40 bytes into its piece 0: piece 0 is short, the
         // others straddle title pieces and start off a multiple of 16.
         const SKEW: u32 = 40;
-        let size = PIECE * PIECES as usize;
+        let size = piece_bytes * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
         let (_differs, _, differs_gpu) = warp.shared_buffer(64);
@@ -1428,35 +1438,36 @@ void main() {
         run(&mut warp, 0, 0);
         // Piece 2 of the copy (title piece 2: bytes 2 * 64 KiB - 40 on), its
         // slot from the multiple of 16 below to the one above its end.
-        let from = 2 * PIECE - SKEW as usize;
+        let from = 2 * piece_bytes - SKEW as usize;
         let widened = from & !15;
         assert_ne!(widened, from);
         set(from + 100, content[from + 100] ^ 0x40);
         let table = run(&mut warp, 2, 0);
         assert_eq!(table, [1, INFLIGHT_NONE, INFLIGHT_NONE, 0, INFLIGHT_NONE]);
-        let mut wanted = content[widened..widened + INFLIGHT_SLOT as usize].to_vec();
+        let widened_len = piece_bytes + 16;
+        let mut wanted = content[widened..widened + widened_len].to_vec();
         wanted[from + 100 - widened] ^= 0x40;
-        assert_eq!(slot(INFLIGHT_SLOT as usize), wanted, "piece 2 in slot 0");
+        assert_eq!(slot(widened_len), wanted, "piece 2 in slot 0");
         // Two pieces flagged with one slot, ticket 0 not landed: tickets 1
         // and 2 get none and the slot keeps what it held.
         set(5, content[5] ^ 1);
-        set(PIECE + 7, content[PIECE + 7] ^ 1);
+        set(piece_bytes + 7, content[piece_bytes + 7] ^ 1);
         let table = run(&mut warp, 2, 0);
         assert_eq!(table[0], 3);
         let mut tickets = [table[1], table[2]];
         tickets.sort_unstable();
         assert_eq!(tickets, [1, 2]);
         assert_eq!(&table[3..], [INFLIGHT_NONE, INFLIGHT_NONE]);
-        assert_eq!(slot(INFLIGHT_SLOT as usize), wanted);
+        assert_eq!(slot(widened_len), wanted);
         // Every ticket up to 2 landed: the next one, 3, gets slot 0. Piece
         // 0 starts at the copy's start.
         set(9, content[9] ^ 2);
         let table = run(&mut warp, 2, 3);
         assert_eq!(table, [4, 3, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE]);
-        let mut piece0 = content[..PIECE - SKEW as usize].to_vec();
+        let mut piece0 = content[..piece_bytes - SKEW as usize].to_vec();
         piece0[5] ^= 1;
         piece0[9] ^= 2;
-        assert_eq!(slot(PIECE - SKEW as usize), piece0);
+        assert_eq!(slot(piece_bytes - SKEW as usize), piece0);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
