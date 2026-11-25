@@ -1599,7 +1599,7 @@ impl State {
             *generation = now;
             *passes = 0;
         }
-        let slots = if *passes % 16 == 0 {
+        let slots = if *passes % 64 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
