@@ -3425,6 +3425,7 @@ impl Shadow {
                 }
                 let n = hi - lo;
                 let title = &mut title[..n];
+                let mut merged_bytes = 0usize;
                 if self.card.is_some() {
                     // The write lock of the copy's carded merge, from before
                     // title memory is read until the title's bytes are in:
@@ -3488,6 +3489,10 @@ impl Shadow {
                         merged_bytes += m;
                     }
                     drop(before);
+                }
+                if !runs.is_empty() {
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(merged_bytes as u64, Ordering::Relaxed);
                 }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
