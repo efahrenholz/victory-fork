@@ -238,7 +238,7 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -248,6 +248,18 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         )
+    }
+
+    /// The blend state for the host. D3D12 refuses a pipeline that blends
+    /// into an integer render target (debug layer message 676); the console
+    /// creates it. With `VICTORY_BLEND_INT_OFF=1` blending is turned off for
+    /// the integer targets and kept for the others.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_BLEND_INT_OFF").is_some_and(|v| v == "1")) {
+            return self.blend;
+        }
+        blend_without_integers(self.blend, &self.targets)
     }
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
@@ -1144,12 +1156,81 @@ fn root_signature(
     }
 }
 
+/// `blend` with blending off for the integer targets of `targets`. Without
+/// independent blending slot 0's state is every slot's, so it is spread first.
+fn blend_without_integers(mut blend: D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let integer = |f: DXGI_FORMAT| {
+        matches!(
+            f,
+            DXGI_FORMAT_R32G32B32A32_UINT
+                | DXGI_FORMAT_R32G32B32A32_SINT
+                | DXGI_FORMAT_R32G32B32_UINT
+                | DXGI_FORMAT_R32G32B32_SINT
+                | DXGI_FORMAT_R16G16B16A16_UINT
+                | DXGI_FORMAT_R16G16B16A16_SINT
+                | DXGI_FORMAT_R32G32_UINT
+                | DXGI_FORMAT_R32G32_SINT
+                | DXGI_FORMAT_R10G10B10A2_UINT
+                | DXGI_FORMAT_R8G8B8A8_UINT
+                | DXGI_FORMAT_R8G8B8A8_SINT
+                | DXGI_FORMAT_R16G16_UINT
+                | DXGI_FORMAT_R16G16_SINT
+                | DXGI_FORMAT_R32_UINT
+                | DXGI_FORMAT_R32_SINT
+                | DXGI_FORMAT_R8G8_UINT
+                | DXGI_FORMAT_R8G8_SINT
+                | DXGI_FORMAT_R16_UINT
+                | DXGI_FORMAT_R16_SINT
+                | DXGI_FORMAT_R8_UINT
+                | DXGI_FORMAT_R8_SINT
+        )
+    };
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let blends = |b: &D3D12_BLEND_DESC, i: usize| {
+        b.RenderTarget[if b.IndependentBlendEnable.as_bool() { i } else { 0 }].BlendEnable.as_bool()
+    };
+    if !(0..count).any(|i| integer(targets.RTFormats[i]) && blends(&blend, i)) {
+        return blend;
+    }
+    if !blend.IndependentBlendEnable.as_bool() {
+        blend.RenderTarget = [blend.RenderTarget[0]; 8];
+        blend.IndependentBlendEnable = true.into();
+    }
+    for i in (0..count).filter(|&i| integer(targets.RTFormats[i])) {
+        blend.RenderTarget[i].BlendEnable = false.into();
+    }
+    blend
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// Blending goes off for an integer target only, and a state shared by
+    /// every slot is spread before one slot leaves it.
+    #[test]
+    fn blending_into_an_integer_target_is_turned_off_for_that_target() {
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        blend.RenderTarget[0].RenderTargetWriteMask = 15;
+        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 3, ..Default::default() };
+        targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        let host = blend_without_integers(blend, &targets);
+        assert!(host.IndependentBlendEnable.as_bool());
+        let on: Vec<bool> = host.RenderTarget.iter().map(|t| t.BlendEnable.as_bool()).collect();
+        assert_eq!(on[..3], [true, true, false]);
+        assert_eq!(host.RenderTarget[2].RenderTargetWriteMask, 15);
+        // Nothing to do: the state comes back as it was.
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        assert!(!blend_without_integers(blend, &targets).IndependentBlendEnable.as_bool());
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
