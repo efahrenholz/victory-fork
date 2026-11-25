@@ -3634,6 +3634,35 @@ fn land() {
     }
 }
 
+/// [`land`] at the end of a submission, on a thread of its own with
+/// `VICTORY_LAND_ASIDE=1` (off by default): resetting the lists of landed
+/// flights is the host's and the driver's work on their allocators, a
+/// tenth of the submitting thread's time in gameplay on a six-thread
+/// processor, and nothing the submission that follows waits for.
+fn land_after_submission() {
+    static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<()>>> = OnceLock::new();
+    let aside = ASIDE.get_or_init(|| {
+        if !std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let (send, asked) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("victory-land".to_owned())
+            .spawn(move || {
+                while asked.recv().is_ok() {
+                    while asked.try_recv().is_ok() {}
+                    land();
+                }
+            })
+            .ok()
+            .map(|_| send)
+    });
+    match aside {
+        Some(send) if send.send(()).is_ok() => {}
+        _ => land(),
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -6125,7 +6154,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
