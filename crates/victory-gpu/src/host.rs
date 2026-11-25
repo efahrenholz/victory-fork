@@ -6018,7 +6018,15 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + {
+            static SWEEP_MS: OnceLock<u64> = OnceLock::new();
+            *SWEEP_MS.get_or_init(|| {
+                std::env::var("VICTORY_SWEEP_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10_000)
+            })
+        } {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
