@@ -9011,6 +9011,7 @@ impl Host {
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));
+            poll_fullscreen_hotkey(p.hwnd);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -9492,6 +9493,31 @@ fn toggle_borderless_fullscreen(hwnd: HWND) {
     }
 }
 
+const WM_TOGGLE_FULLSCREEN: u32 = WM_APP + 1;
+
+/// Edge-triggered poll for Alt+Enter / F11 from `present()` so remote-play
+/// clients (Razer Remote Play / Moonlight / NoMachine) toggle borderless
+/// fullscreen reliably even when WM_SYSKEYDOWN doesn't fire.
+fn poll_fullscreen_hotkey(hwnd: HWND) {
+    use std::sync::atomic::AtomicBool;
+    static WAS_DOWN: AtomicBool = AtomicBool::new(false);
+    // Win32 GetAsyncKeyState from user32.dll (avoids needing Win32_UI_Input_KeyboardAndMouse feature).
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    let f11 = unsafe { GetAsyncKeyState(0x7A) } < 0;
+    let alt_enter = unsafe { GetAsyncKeyState(0x12) } < 0 && unsafe { GetAsyncKeyState(0x0D) } < 0;
+    let down = f11 || alt_enter;
+    let prev = WAS_DOWN.swap(down, Ordering::Relaxed);
+    if down && !prev {
+        // SAFETY: posts our private message to the window thread that owns `hwnd`.
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_TOGGLE_FULLSCREEN, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -9500,6 +9526,10 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     const VK_RETURN_CODE: usize = 0x0D;
     const VK_F11_CODE: usize = 0x7A;
+    if message == WM_TOGGLE_FULLSCREEN {
+        toggle_borderless_fullscreen(hwnd);
+        return LRESULT(0);
+    }
     let first_press = (lparam.0 & (1 << 30)) == 0;
     if first_press
         && ((message == WM_SYSKEYDOWN && wparam.0 == VK_RETURN_CODE)
