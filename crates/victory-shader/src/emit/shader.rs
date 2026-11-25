@@ -72,6 +72,9 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// `[earlydepthstencil]`: depth and stencil are tested before the
+    /// program runs (no SFI0 feature bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -444,6 +447,11 @@ impl Shader {
     }
 
     /// The finished container.
+    pub(crate) fn early_depth_emitted(&self) -> bool {
+        self.flags & flags::EARLY_DEPTH != 0
+            && !self.outputs.iter().any(|o| matches!(o.kind, 17..=20))
+    }
+
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
@@ -691,6 +699,11 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // DXIL forbids ForceEarlyDepthStencil when the shader writes depth or
+        // stencil ref (SV_Depth* = 17..=19, SV_StencilRef = 20).
+        if !self.early_depth_emitted() {
+            self.flags &= !flags::EARLY_DEPTH;
+        }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
@@ -886,5 +899,72 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod early_depth_tests {
+    use super::super::container::SigElement;
+    use super::super::lower::{Parts, lower};
+    use crate::native::StageIo;
+    use crate::{HwStage, NativeProgram, io, ir, resource, structure};
+
+    fn lower_ps(db_shader_control: u32, outputs: Vec<SigElement>) -> bool {
+        // Minimal pixel shader: s_endpgm.
+        let code = 0xBF81_0000u32.to_le_bytes().to_vec();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control,
+                patches: Vec::new(),
+            },
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, &native).expect("io");
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs,
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        l.early_depth
+    }
+
+    #[test]
+    fn sets_early_depth_when_depth_before_shader_bit_is_set() {
+        assert!(lower_ps(1 << 12, Vec::new()));
+        assert!(!lower_ps(0, Vec::new()));
+    }
+
+    #[test]
+    fn suppresses_early_depth_when_shader_writes_depth_output() {
+        let depth_out = SigElement {
+            name: "SV_Depth".into(),
+            index: 0,
+            kind: 17,
+            comp: 9,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        assert!(!lower_ps(1 << 12, vec![depth_out]));
     }
 }

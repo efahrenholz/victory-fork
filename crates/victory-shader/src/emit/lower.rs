@@ -65,6 +65,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    #[cfg(test)]
+    pub early_depth: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1403,6 +1405,14 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // The console tests depth and stencil before the pixel shader runs
+        // (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12).
+        const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+        if let StageIo::Ps { db_shader_control, .. } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
@@ -2289,6 +2299,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.early_depth_emitted(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
