@@ -9078,6 +9078,10 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // Keep DXGI out of exclusive fullscreen on Alt+Enter (which collapses
+            // the window and breaks remote capture); `window_proc` toggles clean
+            // borderless fullscreen instead.
+            let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -9436,12 +9440,78 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+/// Saved windowed placement while toggled into borderless fullscreen via Alt+Enter / F11.
+static WINDOWED_STATE: Mutex<Option<(isize, i32, windows::Win32::Foundation::RECT)>> =
+    Mutex::new(None);
+
+fn toggle_borderless_fullscreen(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    let mut saved = WINDOWED_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        if let Some((saved_hwnd, style, rect)) = saved.take()
+            && saved_hwnd == hwnd.0 as isize
+        {
+            SetWindowLongW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_NOTOPMOST),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+            );
+            return;
+        }
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_ok() {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(monitor, &mut info).as_bool() {
+                *saved = Some((hwnd.0 as isize, style, rect));
+                let r = info.rcMonitor;
+                let borderless = (style & !(WS_OVERLAPPEDWINDOW.0 as i32)) | (WS_POPUP.0 as i32);
+                SetWindowLongW(hwnd, GWL_STYLE, borderless);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    const VK_RETURN_CODE: usize = 0x0D;
+    const VK_F11_CODE: usize = 0x7A;
+    let first_press = (lparam.0 & (1 << 30)) == 0;
+    if first_press
+        && ((message == WM_SYSKEYDOWN && wparam.0 == VK_RETURN_CODE)
+            || (message == WM_KEYDOWN && wparam.0 == VK_F11_CODE))
+    {
+        toggle_borderless_fullscreen(hwnd);
+        return LRESULT(0);
+    }
+    // Suppress the Windows default beep on Alt+Enter.
+    if message == WM_SYSCHAR && wparam.0 == VK_RETURN_CODE {
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
