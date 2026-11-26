@@ -43,13 +43,7 @@ float4 blend(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
 /// Descriptor pairs (and target views) used in turn, one per present: more
 /// than the presents that can be in the air at once.
-///
-/// Deep on purpose: the descriptors are rewritten from the CPU on every
-/// present, so a slot that wraps while its frame is still in flight makes
-/// that frame sample the previous frame's plane (the picture shifts shade
-/// and can come out black). 16 was not enough with a 2-buffer swap chain
-/// and submissions sent ahead; 512 costs ~48 KiB of descriptors.
-const RING: u32 = 512;
+const RING: u32 = 16;
 const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 
 pub(crate) struct Compose {
