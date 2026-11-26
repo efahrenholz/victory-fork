@@ -10013,13 +10013,15 @@ impl Host {
                         overlay_state,
                     );
                     copy.close();
-                    match slot {
-                        Some(i) => {
-                            let flown = self.execute_own(copy);
-                            p.ahead[i].1 = flown;
-                        }
-                        None => self.execute(&[copy]),
-                    }
+                    // Proven by test (v44): the compose must run in order on
+                    // the submitting thread, after the title's own lists. In a
+                    // list sent ahead it samples planes the title is still
+                    // drawing, and the picture flashes black / shifts shade /
+                    // loses parts of meshes, one flash per present.
+                    // Costs frame time (the wait for the card is real work
+                    // that cannot be skipped) but it is the correct picture.
+                    let _ = slot;
+                    self.execute(&[copy]);
                     let composed = p.swap_chain.Present(0, DXGI_PRESENT(0));
                     if composed.is_err() {
                         tracing::warn!(error = ?composed, back = index, "present refused after compose");
