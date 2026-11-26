@@ -1296,6 +1296,11 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);

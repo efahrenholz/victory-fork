@@ -71,6 +71,9 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its output can provide the sky dome for ambient lighting.
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -127,6 +130,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 resolves_light: bytes
                     .windows(crate::ambient::PROGRAM.len())
                     .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                draws_sky: bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
             })
         })
         .clone()
