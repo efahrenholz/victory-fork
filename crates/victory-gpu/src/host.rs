@@ -10013,14 +10013,13 @@ impl Host {
                         overlay_state,
                     );
                     copy.close();
-                    // The compose samples the planes the title has just drawn
-                    // into. It must run on the submitting thread, in order,
-                    // after the title's own lists: a list sent ahead samples a
-                    // plane the title is still drawing, so the picture shifts
-                    // shade, loses parts of meshes, and sometimes comes out
-                    // black (one flash per present).
-                    let _ = slot;
-                    self.execute(&[copy]);
+                    match slot {
+                        Some(i) => {
+                            let flown = self.execute_own(copy);
+                            p.ahead[i].1 = flown;
+                        }
+                        None => self.execute(&[copy]),
+                    }
                     let composed = p.swap_chain.Present(0, DXGI_PRESENT(0));
                     if composed.is_err() {
                         tracing::warn!(error = ?composed, back = index, "present refused after compose");
