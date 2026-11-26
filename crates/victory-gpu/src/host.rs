@@ -9947,6 +9947,14 @@ impl Host {
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
+            {
+                static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static LAST_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(99);
+                let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+                if LAST_INDEX.swap(index, Ordering::Relaxed) != index || n % 48 == 0 {
+                    tracing::info!(back = index, presents = n, "present: back-buffer index");
+                }
+            }
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
@@ -9975,9 +9983,14 @@ impl Host {
             copy.reset();
             let list = &copy.list;
             static NO_COMPOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            // Which present path ran last: 0 compose, 1 copy only (diagnostic).
+            static LAST_PATH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(9);
             if let Some((overlay, overlay_state)) = interface
                 && !NO_COMPOSE.load(Ordering::Relaxed)
             {
+                if LAST_PATH.swap(0, Ordering::Relaxed) != 0 {
+                    tracing::info!(back = index, "present path: COMPOSE (two planes)");
+                }
                 if p.compose.as_ref().is_none_or(|c| c.format() != p.format) {
                     p.compose = match crate::compose::Compose::new(&self.device, p.format) {
                         Ok(c) => Some(c),
@@ -10000,17 +10013,28 @@ impl Host {
                         overlay_state,
                     );
                     copy.close();
-                    match slot {
-                        Some(i) => {
-                            let flown = self.execute_own(copy);
-                            p.ahead[i].1 = flown;
-                        }
-                        None => self.execute(&[copy]),
+                    // The compose samples the planes the title has just drawn
+                    // into. It must run on the submitting thread, in order,
+                    // after the title's own lists: a list sent ahead samples a
+                    // plane the title is still drawing, so the picture shifts
+                    // shade, loses parts of meshes, and sometimes comes out
+                    // black (one flash per present).
+                    let _ = slot;
+                    self.execute(&[copy]);
+                    let composed = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                    if composed.is_err() {
+                        tracing::warn!(error = ?composed, back = index, "present refused after compose");
                     }
-                    let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
                     p.meter.frame(p.hwnd);
                     return Some(false);
                 }
+            }
+            if LAST_PATH.swap(1, Ordering::Relaxed) != 1 {
+                tracing::info!(
+                    back = index,
+                    interface_plane = interface.is_some(),
+                    "present path: COPY ONLY (no interface plane supplied)"
+                );
             }
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
