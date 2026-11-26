@@ -680,6 +680,11 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+thread_local! {
+    /// This thread is inside [`HostHeap::publish`].
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -1788,6 +1793,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.get() {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -2276,6 +2284,77 @@ impl HostHeap {
     /// with before the question whether its slot was a table's lately. So
     /// the count of slots "left to the draws" is now of records that
     /// changed, not of every record on the page. The slots to mirror are
+    /// made after the page's walk, in slot order as before.
+    pub(crate) fn mirror_copied_page(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots {
+                let handle = start + index * step;
+                // A record that straddles the range's ends is left to the
+                // range that holds its first byte.
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page.get(at..at + step as usize) else {
+                    continue;
+                };
+                looked += 1;
+                // None past the host heap's slots, as `mirror_copied`.
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                // Never 0, which is "never looked at".
+                let print = record_print(record) | 1;
+                // The record last seen, or a slot never looked at that
+                // holds nothing: as it was.
+                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                    continue;
+                }
+                // A table's slot lately: left to its draws, and looked at
+                // again next time.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                *last = print;
+                due.push((index as u32, handle));
+            }
+        }
+        for &(index, handle) in &due {
+            self.mirror(index, handle, false);
+        }
+        (looked, due.len() as u64)
+    }
+
+    /// Makes host slot `index` from the record at `handle` if it is still
+    /// the one with `key`, whose texture's upload is in the queue now
+    /// (`crate::heap_worker`). The slot's place in the queue of textures
+    /// picked by index was settled when that upload was recorded, and stays
+    /// as it is. False if the title wrote the slot again.
+    pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || u64::from(generation) << 32 | u64::from(i) != key {
+            return false;
+        }
+        PUBLISHING.set(true);
+        let shown = self.mirror(index, handle, true).is_some();
+        PUBLISHING.set(false);
+        shown
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -4632,6 +4711,38 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         coalesce_texture_changes(&mut ranges);
         assert_eq!(ranges, [(0x3800, 0x5000), (0xc000, 0xd000)]);
         assert_eq!((slots_in(&ranges), slots_holding(&ranges)), expected);
+    /// A slot whose texture was uploaded ahead shows it when it is
+    /// published, and does not go back into the queue of textures picked by
+    /// index for that; one the title wrote again is left alone.
+    #[test]
+    fn a_published_slot_stays_out_of_the_queue() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let title = [0u32; 8];
+        let handle = title.as_ptr() as u64;
+        crate::descriptor::record(handle, view(0x7fec_0000_0000));
+        let (first, key) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(index, 1);
+        // Its upload was recorded: out of the queue, the slot not made yet.
+        heap.texture_slot_done(1, write, None);
+        assert!(!heap.made(1));
+        assert!(heap.publish(1, handle, key));
+        assert!(heap.made(1));
+        assert!(heap.texture_slots_due(u64::MAX, 8).0.is_empty());
+        // Written again since the upload was recorded.
+        crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        assert!(!heap.publish(1, handle, key));
+        assert_ne!(crate::descriptor::view_and_key(handle).unwrap().1, key);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
