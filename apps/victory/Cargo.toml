@@ -26,6 +26,7 @@ walkdir.workspace = true
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [
     "victory-core/diagnostics",
+    "victory-gpu/diagnostics",
     "victory-hle/diagnostics",
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
