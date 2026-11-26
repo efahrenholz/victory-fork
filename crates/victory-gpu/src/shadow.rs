@@ -3338,6 +3338,10 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// [`Shadow::put_back_own_or_defer`]'s counters, since the start: stores
+/// kept for the end of the merge pass, their bytes, and stores drained.
+static OWN_DEFER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 impl Shadow {
     /// Where the title buffer starts (`crate::census`).
     pub(crate) fn title_start(&self) -> u64 {
@@ -3905,7 +3909,6 @@ impl Shadow {
     /// exists to kill). True if the store went, or will go, through a view
     /// of our own.
     fn put_back_own_or_defer(&self, at: usize, bytes: &[u8]) -> bool {
-        static DEFERRED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
         if !crate::inplace::back_own() {
             return false;
         }
@@ -3916,13 +3919,13 @@ impl Shadow {
             }
             Err(crate::inplace::OwnWhy::Reading) => {
                 self.own_pending.lock().unwrap_or_else(|e| e.into_inner()).push((at, bytes.to_vec()));
-                DEFERRED[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                let n = DEFERRED[0].fetch_add(1, Ordering::Relaxed) + 1;
+                OWN_DEFER[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let n = OWN_DEFER[0].fetch_add(1, Ordering::Relaxed) + 1;
                 if n % 16384 == 1 {
                     tracing::info!(
                         "what shaders wrote, kept for the end of the merge pass while the runtime was remapping, since the start: {n} stretches {} MB, {} of them drained so far",
-                        DEFERRED[1].load(Ordering::Relaxed) >> 20,
-                        DEFERRED[2].load(Ordering::Relaxed),
+                        OWN_DEFER[1].load(Ordering::Relaxed) >> 20,
+                        OWN_DEFER[2].load(Ordering::Relaxed),
                     );
                 }
                 true
@@ -3939,6 +3942,7 @@ impl Shadow {
     /// in the same frame.
     pub(crate) fn drain_own_pending(&self) {
         let pending = std::mem::take(&mut *self.own_pending.lock().unwrap_or_else(|e| e.into_inner()));
+        OWN_DEFER[2].fetch_add(pending.len() as u64, Ordering::Relaxed);
         for (at, bytes) in pending {
             if self.put_back_own(at, &bytes) {
                 continue;
