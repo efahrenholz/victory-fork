@@ -3610,7 +3610,7 @@ fn given_to_shaders<'a>(
     let mut given = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step
+            if let Step::GpuWrite(shadow, address, len, _) = step
                 && (!carded || shadow.carded())
             {
                 given.push((shadow.clone(), (*address, *address + *len)));
