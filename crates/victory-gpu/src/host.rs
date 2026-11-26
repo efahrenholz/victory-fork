@@ -4089,6 +4089,7 @@ fn relay_hand_back(back: &[Declared]) {
                         for (at, n) in found {
                             written += shadow.relay_merge(at, n, &mut now, &mut title);
                         }
+                        shadow.drain_own_pending();
                         copy_back(1, written as u64);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::compared(from, to - from, written);
@@ -4106,6 +4107,7 @@ fn relay_hand_back(back: &[Declared]) {
         for (at, n) in found {
             written += shadow.relay_merge(at, n, &mut now, &mut title);
         }
+        shadow.drain_own_pending();
         copy_back(1, written as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::compared(*from, to - from, written);
@@ -5696,6 +5698,7 @@ impl Host {
                             // `total` of them; the copy into it has run.
                             let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
                             let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            shadow.drain_own_pending();
                             shadow.walls_merged(gpu.len(), merged);
                             w += merged;
                         }
@@ -5713,6 +5716,7 @@ impl Host {
                 // the copy into it has run.
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.drain_own_pending();
                 shadow.walls_merged(gpu.len(), merged);
                 written += merged;
             }
@@ -5884,6 +5888,7 @@ impl Host {
                             // plan's flight, which the card has run.
                             let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
                             w += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            shadow.drain_own_pending();
                             b += (hi - lo) as u64;
                         }
                         total_written.fetch_add(w, Ordering::Relaxed);
@@ -5901,6 +5906,7 @@ impl Host {
                 // copy into it ran in the plan's flight, which the card has run.
                 let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
                 written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+                shadow.drain_own_pending();
                 bytes += (hi - lo) as u64;
             }
             (written, bytes)

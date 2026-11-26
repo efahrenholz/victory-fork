@@ -73,6 +73,11 @@ pub(crate) struct Shadow {
     /// `card_merge_relay` workers merging disjoint 64 KiB pieces (read lock)
     /// on a carded copy.
     card_merge_lock: std::sync::RwLock<()>,
+    /// Stores through views of our own that the mapping lock kept from
+    /// writing at their merge ([`put_back_own_or_defer`]): the stretch's
+    /// title address and bytes, written at the end of the merge pass
+    /// ([`drain_own_pending`]).
+    own_pending: Mutex<Vec<(usize, Vec<u8>)>>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// A window whose one buffer is in a GPU upload heap ([`window_upload`]):
@@ -3443,6 +3448,7 @@ impl Shadow {
             },
             card: None,
             card_merge_lock: std::sync::RwLock::new(()),
+            own_pending: Mutex::default(),
             window: false,
             uploaded: 0,
             place: None,
@@ -3846,7 +3852,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own_or_defer(start + at, &title[..]) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;
@@ -3870,6 +3876,82 @@ impl Shadow {
     /// this one too. False with nothing done if the switch is off or the
     /// memory cannot be written that way (the caller writes as before).
     fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+        /// Stretches written the old way after this was tried, since the
+        /// start (counted by [`own_stored`] otherwise).
+        static OLD_WAY: AtomicU64 = AtomicU64::new(0);
+        if !crate::inplace::back_own() {
+            return false;
+        }
+        match crate::inplace::write_own(at, bytes) {
+            Ok(shown) => {
+                self.own_stored(at, bytes, shown);
+                true
+            }
+            Err(_) => {
+                OLD_WAY.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// [`put_back_own`] for a merge pass in progress ([`relay_merge`],
+    /// [`card_merge_relay`]): a store that fails only because the runtime
+    /// is remapping title memory at this moment ([`crate::inplace::OwnWhy::Reading`]
+    /// — three fifths of the failures measured in the demand census:
+    /// no-reading-lock 28,673 against 6,608 passing) is kept and written at
+    /// the end of the pass ([`drain_own_pending`]), milliseconds later,
+    /// instead of the old way at once (the old way opens the page's guard
+    /// and the next refresh takes the page again: the echo this switch
+    /// exists to kill). True if the store went, or will go, through a view
+    /// of our own.
+    fn put_back_own_or_defer(&self, at: usize, bytes: &[u8]) -> bool {
+        static DEFERRED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        if !crate::inplace::back_own() {
+            return false;
+        }
+        match crate::inplace::write_own(at, bytes) {
+            Ok(shown) => {
+                self.own_stored(at, bytes, shown);
+                true
+            }
+            Err(crate::inplace::OwnWhy::Reading) => {
+                self.own_pending.lock().unwrap_or_else(|e| e.into_inner()).push((at, bytes.to_vec()));
+                DEFERRED[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let n = DEFERRED[0].fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 16384 == 1 {
+                    tracing::info!(
+                        "what shaders wrote, kept for the end of the merge pass while the runtime was remapping, since the start: {n} stretches {} MB, {} of them drained so far",
+                        DEFERRED[1].load(Ordering::Relaxed) >> 20,
+                        DEFERRED[2].load(Ordering::Relaxed),
+                    );
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The stores [`put_back_own_or_defer`] kept, after a copy's stretches
+    /// of a merge pass: each tried once more through a view of our own,
+    /// written the old way if it still cannot be (the runtime may still be
+    /// remapping, or the page is not view memory). The pass calls this
+    /// once per copy, so a kept store lands milliseconds after its merge,
+    /// in the same frame.
+    pub(crate) fn drain_own_pending(&self) {
+        let pending = std::mem::take(&mut *self.own_pending.lock().unwrap_or_else(|e| e.into_inner()));
+        for (at, bytes) in pending {
+            if self.put_back_own(at, &bytes) {
+                continue;
+            }
+            crate::watch::writing(at, bytes.len());
+            crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+        }
+    }
+
+    /// The tail of [`put_back_own`] once the bytes are in through a view
+    /// of our own: the journal is told, and the page is noted current for
+    /// this copy if it was current before.
+    fn own_stored(&self, at: usize, bytes: &[u8], shown: Vec<usize>) {
         /// Since the start: stretches and bytes stored this way, pages
         /// noted current for their copy, stretches written the old way;
         /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
@@ -3880,13 +3962,6 @@ impl Shadow {
         static OWN_WRITES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let check = *CHECK.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_CHECK").is_some_and(|v| v == "1"));
-        if !crate::inplace::back_own() {
-            return false;
-        }
-        let Some(shown) = crate::inplace::write_own(at, bytes) else {
-            OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
         if check {
             // The title's own address must show what went in through ours.
             let mut back = vec![0u8; bytes.len()];
@@ -3941,7 +4016,6 @@ impl Shadow {
                 OWN_WRITES[6].load(Ordering::Relaxed)
             );
         }
-        true
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -4755,7 +4829,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own_or_defer(start + at, &title[..]) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;

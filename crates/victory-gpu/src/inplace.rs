@@ -771,44 +771,72 @@ fn own_view(section: usize, bytes: u64) -> Option<Own> {
 /// host refused the view (not asked again).
 static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex::new(None);
 
+/// Why [`write_own`] did nothing: which early return fired. The caller
+/// cares about [`OwnWhy::Reading`]: the mapping lock was held by the
+/// runtime's own mapping work, a momentary state, so the store is worth
+/// trying again a few milliseconds later (the end of the merge pass)
+/// instead of writing the old way, which opens the page's guard and
+/// costs the refresh echo.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum OwnWhy {
+    /// The stretch is not inside one 64 KiB page.
+    Span,
+    /// The mapping lock was held (the runtime remapping title memory).
+    Reading,
+    /// No title view shows the page (not view memory, or the view gone).
+    View,
+    /// Too many views of the page, or a later bound refused it.
+    Other,
+}
+
 /// Stores `bytes` at title address `at` through a view of our own
 /// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
 /// a title view of a section. Gives the addresses of that page in every
-/// title view that shows it (the page of `at` among them), or `None` with
-/// nothing written: not view memory, a page of very many views, the
-/// runtime changing mappings at this moment, or the host refusing.
-pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+/// title view that shows it (the page of `at` among them), or why
+/// nothing was written ([`OwnWhy`]).
+pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Result<Vec<usize>, OwnWhy> {
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
-        return None;
+        return Err(OwnWhy::Span);
     }
     // No mapping changes until the bytes are in: the view found below
     // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
+    let Some(_still) = crate::watch::title_memory_reading_now() else {
+        return Err(OwnWhy::Reading);
+    };
     let (section, offset, shown, section_bytes) = {
         let v = views();
-        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
+        let Some((&base, &(len, section, offset))) = v.views.range(..=at).next_back() else {
+            return Err(OwnWhy::View);
+        };
         if at + bytes.len() > base + len {
-            return None;
+            return Err(OwnWhy::View);
         }
         let offset = offset + (at - base) as u64;
-        let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
+        let Some(shown) = v.pages.get(&(section, offset - offset % K64 as u64)).cloned() else {
+            return Err(OwnWhy::View);
+        };
         if shown.len() > crate::watch::MANY_VIEWS {
-            return None;
+            return Err(OwnWhy::Other);
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let Some(section_bytes) = v.sections.iter().find(|s| s.0 == section).map(|s| s.1) else {
+            return Err(OwnWhy::View);
+        };
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
-        return None;
+        return Err(OwnWhy::Other);
     }
     let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
-    let view = own
+    let Some(view) = own
         .get_or_insert_with(Default::default)
         .entry(section)
         .or_insert_with(|| own_view(section, section_bytes))
-        .as_mut()?;
+        .as_mut()
+    else {
+        return Err(OwnWhy::Other);
+    };
     if offset + bytes.len() as u64 > view.bytes {
-        return None;
+        return Err(OwnWhy::Other);
     }
     let block = offset as usize / K64;
     if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
@@ -819,14 +847,14 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
             mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
         };
         if there.is_null() {
-            return None;
+            return Err(OwnWhy::Other);
         }
         view.committed[block / 64] |= 1u64 << (block % 64);
     }
     // SAFETY: committed bytes inside our own view; the source is the
     // caller's slice.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
-    Some(shown)
+    Ok(shown)
 }
 
 /// How the views cover `[at, at + len)`.
