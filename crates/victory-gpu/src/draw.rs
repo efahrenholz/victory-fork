@@ -2515,18 +2515,21 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                match &mut into {
+                let _ = match &mut into {
                     Into::List(list) => readable(list, sampled.kind, view),
                     Into::Ahead(batch) => {
-                        let Some(list) = batch.list() else {
-                            return;
+                        let shown = {
+                            let Some(list) = batch.list() else {
+                                return;
+                            };
+                            readable(list, sampled.kind, view)
                         };
-                        readable(list, sampled.kind, view);
                         if let (Some(handle), Some((_, key))) = (heap.handle(index), &record) {
                             batch.publish(index, handle, *key);
                         }
+                        shown
                     }
-                }
+                };
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
